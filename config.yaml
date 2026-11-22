@@ -5,8 +5,13 @@ pipeline:
   n_samples: 1200
 
 data:
-  # Synthetic EHR extract is generated locally (no external download).
-  local_raw_path: "data/raw_data.csv"
+  # Step 1: synthetic "source EHR" table (what the hospital system knows)
+  source_path: "data/source_ehr_records.csv"
+  # Step 2: the same patients exported as FHIR Bundles, one JSON per line (this is the training input)
+  fhir_version: "R4"
+  bundles_path: "data/fhir/bundles.ndjson"
+  # Step 3: Bundles flattened back into a table + Data Quality Index
+  flattened_path: "data/fhir_flattened_with_dqi.csv"
   target_medication: "recommended_medication_plan"
   target_meal: "recommended_meal_plan"
   unknown_race_label: "Unknown"
@@ -15,12 +20,13 @@ model:
   type: "RandomForestClassifier"
   n_estimators: 100
 
-# Data Quality Index (DQI) parameters — each row starts at 100.
+# Data Quality Index (DQI) — each record starts at 100.
 quality_weights:
-  missing_race_penalty: 25
-  missing_bmi_penalty: 25
+  missing_race_penalty: 25        # no us-core-race / us-core-ethnicity extension (FHIR) or empty PID-10/22 (HL7)
+  missing_bmi_penalty: 25         # no Observation with LOINC 39156-5 / no BMI OBX
   out_of_bounds_bmi_penalty: 25
-  out_of_bounds_hba1c_penalty: 50
+  missing_age_penalty: 25         # no Patient.birthDate / empty PID-7
+  out_of_bounds_hba1c_penalty: 50 # missing, or outside plausible bounds (LOINC 4548-4)
 
 quality_bounds:
   hba1c_min: 3.0
@@ -28,9 +34,14 @@ quality_bounds:
   bmi_min: 10.0
   bmi_max: 80.0
 
-# Rows scoring below this are excluded from training.
-# 75 keeps rows with a single missing field (imputed), drops implausible labs.
+# Records scoring below this are excluded from training (and flagged at prediction time).
 min_quality_threshold: 75
+
+hl7:
+  host: "127.0.0.1"
+  port: 2575                      # standard MLLP port
+  start_with_api: true            # the FastAPI process also runs the MLLP listener
+  inbox_db: "data/hl7_inbox.db"
 
 artifacts:
   model_dir: "models"
@@ -38,3 +49,4 @@ artifacts:
   meal_model_path: "models/meal_model.pkl"
   encoder_path: "models/label_encoders.pkl"
   quality_report_path: "models/quality_report.json"
+  training_summary_path: "models/training_summary.json"

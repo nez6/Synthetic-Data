@@ -1,78 +1,127 @@
-import pickle
-from functools import lru_cache
+"""REST API: plain JSON prediction, FHIR endpoints (all versions) and HL7 inbox.
+
+The same process also runs the HL7 v2 MLLP listener (config: hl7.start_with_api).
+"""
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
-import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from src.config import load_config, resolve
-from src.preprocess import FEATURES
-from src.quality import score_record
-from src.routing import recommend_provider
+from src.config import load_config
+from src.fhir.builder import build_bundle
+from src.fhir.parser import bundle_to_record, detect_version
+from src.fhir.validate import validate_bundle
+from src.fhir.versions import VERSIONS
+from src.hl7v2 import inbox
+from src.hl7v2.mllp import is_listening, start_in_thread
+from src.inference import ModelNotReady, predict
 
-app = FastAPI(title="Demographic Clinical Router & Quality Engine API")
+_listener = {"server": None, "error": None}
 
 
-@lru_cache(maxsize=1)
-def load_artifacts():
-    artifacts = load_config()["artifacts"]
+@asynccontextmanager
+async def lifespan(_app):
+    cfg = load_config()["hl7"]
+    if cfg.get("start_with_api"):
+        from src.hl7v2.listener import handle_message
+        try:
+            _listener["server"] = start_in_thread(cfg["host"], cfg["port"], handle_message)
+            print(f"HL7 v2 MLLP listener started on {cfg['host']}:{cfg['port']}")
+        except OSError as e:
+            _listener["error"] = f"Could not bind {cfg['host']}:{cfg['port']}: {e}"
+            print(_listener["error"])
+    yield
+    if _listener["server"]:
+        _listener["server"].shutdown()
+
+
+app = FastAPI(title="Demographic Clinical Router & Quality Engine API", lifespan=lifespan)
+
+
+def _run(record: dict) -> dict:
     try:
-        with open(resolve(artifacts["med_model_path"]), "rb") as f:
-            med_model = pickle.load(f)
-        with open(resolve(artifacts["meal_model_path"]), "rb") as f:
-            meal_model = pickle.load(f)
-        with open(resolve(artifacts["encoder_path"]), "rb") as f:
-            encoders = pickle.load(f)
-    except FileNotFoundError as e:
-        raise HTTPException(503, f"Model artifacts missing ({e.filename}). Run `python -m src.train` first.")
-    return med_model, meal_model, encoders
+        return predict(record)
+    except ModelNotReady as e:
+        raise HTTPException(503, str(e))
 
+
+def _check_version(version: str):
+    if version not in VERSIONS:
+        raise HTTPException(404, f"Unknown FHIR version {version!r}. Use one of {list(VERSIONS)}")
+
+
+# ----------------------------------------------------------------------------- basics
 
 class ClinicalInput(BaseModel):
     race_demographic: Optional[str] = None
-    age: int = Field(ge=0, le=120)
+    age: Optional[int] = Field(default=None, ge=0, le=120)
     bmi: Optional[float] = None
-    baseline_hba1c: float
+    baseline_hba1c: Optional[float] = None
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    cfg = load_config()["hl7"]
+    return {"status": "ok",
+            "hl7_listener": {"host": cfg["host"], "port": cfg["port"],
+                             "listening": is_listening(cfg["host"], cfg["port"]),
+                             "error": _listener["error"]}}
 
 
 @app.post("/predict")
 def predict_care_and_provider_routing(patient: ClinicalInput):
-    config = load_config()
-    med_model, meal_model, encoders = load_artifacts()
+    result = _run(patient.model_dump())
+    return {"input_record_data_quality_index": f"{result['data_quality_index']}%", **result}
 
-    quality = score_record(patient.race_demographic, patient.bmi, patient.baseline_hba1c)
 
-    race = patient.race_demographic or config["data"]["unknown_race_label"]
-    race_encoder = encoders["race_demographic"]
-    if race not in race_encoder.classes_:
-        race = config["data"]["unknown_race_label"]
-    race_encoded = race_encoder.transform([race])[0]
+# ----------------------------------------------------------------------------- FHIR
 
-    # Missing BMI: fall back to a typical value so a prediction can still be made;
-    # the DQI already reflects the gap.
-    bmi = patient.bmi if patient.bmi is not None else 30.0
-
-    features = pd.DataFrame([{
-        "race_demographic": race_encoded,
-        "age": patient.age,
-        "bmi": bmi,
-        "baseline_hba1c": patient.baseline_hba1c,
-    }])[FEATURES]
-
-    decoded_med = encoders[config["data"]["target_medication"]].inverse_transform(med_model.predict(features))[0]
-    decoded_meal = encoders[config["data"]["target_meal"]].inverse_transform(meal_model.predict(features))[0]
-
+@app.get("/fhir/{version}/metadata")
+def capability_statement(version: str):
+    _check_version(version)
     return {
-        "input_record_data_quality_index": f"{quality['score']}%",
-        "data_quality_issues": quality["issues"],
-        "low_quality_warning": quality["score"] < config["min_quality_threshold"],
-        "predicted_medication_strategy": decoded_med,
-        "predicted_dietary_strategy": decoded_meal,
-        "recommended_provider_routing": recommend_provider(patient.baseline_hba1c, bmi, decoded_med),
+        "resourceType": "CapabilityStatement",
+        "status": "active",
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "kind": "instance",
+        "fhirVersion": VERSIONS[version]["fhirVersion"],
+        "format": ["json"],
+        "rest": [{"mode": "server", "resource": [
+            {"type": "Bundle", "operation": [{"name": "predict",
+                                              "definition": "POST /fhir/{version}/Bundle/$predict"}]}]}],
     }
+
+
+@app.post("/fhir/{version}/Bundle/$predict")
+def fhir_predict(version: str, bundle: dict = Body(...)):
+    """Accept a FHIR Bundle (Patient + Observations), validate it, score DQI and predict."""
+    _check_version(version)
+    if bundle.get("resourceType") != "Bundle":
+        raise HTTPException(400, "Body must be a FHIR Bundle")
+    validation = validate_bundle(bundle, version)
+    detected, evidence = detect_version(bundle)
+    record = bundle_to_record(bundle)
+    return {
+        "fhir_version_declared": version,
+        "fhir_version_detected": detected,
+        "detection_evidence": evidence,
+        "schema_validation": validation,
+        "extracted_record": record,
+        **_run(record),
+    }
+
+
+@app.post("/fhir/{version}/$convert")
+def fhir_convert(version: str, bundle: dict = Body(...)):
+    """Re-express a Bundle (any supported version) in the requested FHIR version."""
+    _check_version(version)
+    return build_bundle(bundle_to_record(bundle), version)
+
+
+# ----------------------------------------------------------------------------- HL7
+
+@app.get("/hl7/inbox")
+def hl7_inbox(limit: int = 50):
+    return inbox.recent(limit)

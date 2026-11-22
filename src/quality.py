@@ -1,12 +1,20 @@
 """Data Quality Index (DQI): deterministic 0-100 completeness/validity score per record.
 
-Shared by the training pipeline (batch scoring) and the API (per-request scoring)
-so both use identical rules.
+Applied to records *after* they are extracted from FHIR (or HL7 v2), so a missing value
+means the corresponding FHIR element / HL7 field was absent. Shared by the training
+pipeline, the REST API and the HL7 listener so every path uses identical rules.
 """
 import math
-from typing import Optional
 
 from src.config import load_config
+
+ISSUE_LABELS = {
+    "missing_race": "Race/ethnicity not recorded",
+    "missing_bmi": "BMI observation missing",
+    "out_of_bounds_bmi": "BMI implausible",
+    "missing_age": "Birth date missing",
+    "out_of_bounds_hba1c": "HbA1c missing or implausible",
+}
 
 
 def _is_missing(value) -> bool:
@@ -19,8 +27,8 @@ def _is_missing(value) -> bool:
     return False
 
 
-def score_record(race: Optional[str], bmi: Optional[float], hba1c: Optional[float]) -> dict:
-    """Return the DQI score and the list of issues found for one record."""
+def score_record(race, bmi, hba1c, age) -> dict:
+    """Return {"score": int, "issues": [str]} for one record."""
     config = load_config()
     w = config["quality_weights"]
     b = config["quality_bounds"]
@@ -39,6 +47,10 @@ def score_record(race: Optional[str], bmi: Optional[float], hba1c: Optional[floa
         score -= w["out_of_bounds_bmi_penalty"]
         issues.append("out_of_bounds_bmi")
 
+    if _is_missing(age):
+        score -= w["missing_age_penalty"]
+        issues.append("missing_age")
+
     if _is_missing(hba1c) or not (b["hba1c_min"] <= hba1c <= b["hba1c_max"]):
         score -= w["out_of_bounds_hba1c_penalty"]
         issues.append("out_of_bounds_hba1c")
@@ -47,10 +59,12 @@ def score_record(race: Optional[str], bmi: Optional[float], hba1c: Optional[floa
 
 
 def score_dataframe(df):
-    """Add a `data_quality_index` column to a DataFrame (returns a copy)."""
+    """Add `data_quality_index` and `data_quality_issues` columns (returns a copy)."""
     out = df.copy()
-    out["data_quality_index"] = [
-        score_record(r, b, h)["score"]
-        for r, b, h in zip(out["race_demographic"], out["bmi"], out["baseline_hba1c"])
+    results = [
+        score_record(r, b, h, a)
+        for r, b, h, a in zip(out["race_demographic"], out["bmi"], out["baseline_hba1c"], out["age"])
     ]
+    out["data_quality_index"] = [r["score"] for r in results]
+    out["data_quality_issues"] = [", ".join(r["issues"]) for r in results]
     return out

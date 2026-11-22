@@ -1,3 +1,4 @@
+"""Step 3: flatten FHIR Bundles → table, score Data Quality, clean, encode, split."""
 import json
 import pickle
 
@@ -6,54 +7,66 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from src.config import load_config, resolve
+from src.fhir.parser import bundle_to_record
 from src.quality import score_dataframe
 
 FEATURES = ["race_demographic", "age", "bmi", "baseline_hba1c"]
 
 
-def evaluate_and_clean_quality(df: pd.DataFrame):
+def flatten_bundles(bundles: list[dict]) -> pd.DataFrame:
+    """Extract model features (and CarePlan labels) from each FHIR Bundle."""
+    df = pd.DataFrame([bundle_to_record(b) for b in bundles])
+    for col in ("age", "bmi", "baseline_hba1c"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def evaluate_and_clean_quality(df: pd.DataFrame, threshold: int = None):
     config = load_config()
     unknown = config["data"]["unknown_race_label"]
+    threshold = config["min_quality_threshold"] if threshold is None else threshold
 
     scored = score_dataframe(df)
-    group_key = scored["race_demographic"].fillna(unknown)
+    scored.to_csv(resolve(config["data"]["flattened_path"]), index=False)
 
-    # Per-demographic quality profile: surfaces systemic documentation gaps.
+    group = scored["race_demographic"].fillna(unknown)
     report = (
-        scored.assign(group=group_key)
+        scored.assign(group=group)
         .groupby("group")
         .agg(
             records=("data_quality_index", "size"),
             mean_dqi=("data_quality_index", "mean"),
             missing_bmi_rate=("bmi", lambda s: float(s.isna().mean())),
+            below_threshold=("data_quality_index", lambda s: int((s < threshold).sum())),
         )
         .round(3)
     )
     print("\n--- BASELINE DATA QUALITY REPORT PER DEMOGRAPHIC ---")
     print(report.to_string())
 
-    threshold = config["min_quality_threshold"]
     cleaned = scored[scored["data_quality_index"] >= threshold].copy()
     print(f"\nKept {len(cleaned)}/{len(scored)} rows with DQI >= {threshold}")
 
-    # Impute: missing race becomes an explicit 'Unknown' category (never a guessed
-    # race); missing BMI takes the median of observed values.
+    # Missing race becomes an explicit 'Unknown' category (never a guessed race);
+    # missing BMI takes the median of observed values.
+    bmi_median = float(cleaned["bmi"].median())
     cleaned["race_demographic"] = cleaned["race_demographic"].fillna(unknown)
-    cleaned["bmi"] = cleaned["bmi"].fillna(cleaned["bmi"].median())
+    cleaned["bmi"] = cleaned["bmi"].fillna(bmi_median)
 
     summary = {
         "overall_mean_dqi": round(float(scored["data_quality_index"].mean()), 3),
         "rows_total": int(len(scored)),
         "rows_kept": int(len(cleaned)),
         "threshold": threshold,
+        "bmi_median": bmi_median,
         "per_demographic": report.to_dict(orient="index"),
     }
     return cleaned, summary
 
 
-def preprocess_pipeline(df: pd.DataFrame):
+def preprocess_pipeline(df: pd.DataFrame, threshold: int = None):
     config = load_config()
-    df_cleaned, quality_summary = evaluate_and_clean_quality(df)
+    df_cleaned, quality_summary = evaluate_and_clean_quality(df, threshold)
     resolve(config["artifacts"]["model_dir"]).mkdir(parents=True, exist_ok=True)
 
     encoders = {}
@@ -76,4 +89,4 @@ def preprocess_pipeline(df: pd.DataFrame):
         test_size=config["pipeline"]["test_size"],
         random_state=config["pipeline"]["random_state"],
     )
-    return splits, quality_summary
+    return splits, quality_summary, encoders
