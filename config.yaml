@@ -1,0 +1,40 @@
+pipeline:
+  project_name: "diabetes_demographic_plan_router"
+  test_size: 0.2
+  random_state: 42
+  n_samples: 1200
+
+data:
+  # Synthetic EHR extract is generated locally (no external download).
+  local_raw_path: "data/raw_data.csv"
+  target_medication: "recommended_medication_plan"
+  target_meal: "recommended_meal_plan"
+  unknown_race_label: "Unknown"
+
+model:
+  type: "RandomForestClassifier"
+  n_estimators: 100
+
+# Data Quality Index (DQI) parameters — each row starts at 100.
+quality_weights:
+  missing_race_penalty: 25
+  missing_bmi_penalty: 25
+  out_of_bounds_bmi_penalty: 25
+  out_of_bounds_hba1c_penalty: 50
+
+quality_bounds:
+  hba1c_min: 3.0
+  hba1c_max: 16.0
+  bmi_min: 10.0
+  bmi_max: 80.0
+
+# Rows scoring below this are excluded from training.
+# 75 keeps rows with a single missing field (imputed), drops implausible labs.
+min_quality_threshold: 75
+
+artifacts:
+  model_dir: "models"
+  med_model_path: "models/medication_model.pkl"
+  meal_model_path: "models/meal_model.pkl"
+  encoder_path: "models/label_encoders.pkl"
+  quality_report_path: "models/quality_report.json"
