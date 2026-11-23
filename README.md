@@ -17,13 +17,14 @@ Open http://localhost:8501 and work through the tabs in order:
 | Tab | What you do |
 |---|---|
 | 🧭 **How it works** | Read the architecture, the DQI rules, the routing rules and a glossary |
+| 🧬 **Test Data Creator** | Enter key demographics and fault rates, then generate, validate and statistically accept a set of test patients. Download it, train on it or send it over HL7 |
 | 1️⃣ **Data** | Generate synthetic patients. View them as the source EHR table, as FHIR Bundles, and as the flattened training table with DQI. See quality broken down by demographic group |
 | 2️⃣ **Train** | Pick a quality threshold and train. See accuracy by group, feature importance, the confusion matrix and the MLflow run history |
 | 3️⃣ **Predict** | Enter a patient. The app builds a FHIR Bundle in the version you choose and calls `/fhir/{version}/Bundle/$predict` |
 | 4️⃣ **FHIR versions** | Compare one patient across DSTU2, STU3, R4, R4B and R5, with schema validation and a line-by-line diff |
 | 5️⃣ **HL7 v2 listener** | Compose an ORU^R01, send it over MLLP and read the ACK. Inspect the inbox: raw HL7 → FHIR R4 → prediction |
 
-Command-line equivalents: `make data`, `make train`, `make send`, `make mlflow`, `make test`.
+Command-line equivalents: `make testdata`, `make data`, `make train`, `make send`, `make mlflow`, `make test`.
 
 ## Architecture
 
@@ -69,6 +70,42 @@ flowchart LR
 | HbA1c ≥ 9.5% | Endocrinology & Metabolic Specialist | High |
 | Combination therapy predicted, or BMI > 32 | Internal Medicine + Registered Dietitian | Routine |
 | Everyone else | Primary Care + Behavioral Health Coach | Preventative |
+
+## Synthetic Test Data Creator
+
+This is a version of [zachana-1/Synthetic-Test-Data-Creator](https://github.com/zachana-1/Synthetic-Test-Data-Creator) adapted to this project. Instead of fixed Synthea cohorts, you define the cohort by its **key demographics** in the dashboard (🧬 tab) or in a JSON spec (`python -m src.testdata.cli --spec cohort.json`).
+
+| Input | Options |
+|---|---|
+| Cohort | number of patients, random seed, age range, % female, states |
+| Race / ethnicity mix | AIAN, Asian, Black/African American, White, Hispanic/Latino, not recorded |
+| Preferred language | English, Spanish, Vietnamese, Chinese, not recorded |
+| Clinical profile | diabetes control mix (HbA1c below 7, 7–9, above 9), BMI mean/SD, years of history, visits per year |
+| Faults to inject | missing BMI, implausible HbA1c, missing birth date (⛔ not repairable); non-UCUM unit, missing Observation category, reversed period, dangling reference, missing HTEST label (🔧 repairable) |
+| Acceptance | H0 pass rate (85%), target (90%), alpha, minimum HbA1c and BMI results per patient |
+
+**Pipeline** (`src/testdata/`):
+
+1. **Generate** (`generator.py`): writes US Core R4 Bundles with a Patient, Practitioner, T2D Condition (SNOMED + ICD-10-CM), Encounters, a series of HbA1c and BMI Observations (LOINC, UCUM), MedicationRequests (RxNorm, matched to the care tier) and CarePlans. Demographics are assigned by quota, so the generated mix matches the request exactly. Every Patient carries a synthetic identifier and the HL7 `HTEST` security label.
+2. **Validate and repair** (`validation.py`): runs checks V01–V09. Repairs are made only when the fix is certain. Nothing is invented: a record that is missing data, or has an implausible lab value, stays failed. A record without the synthetic identifier could be real data, so it is never modified.
+3. **Independent audit** (`audit.py`): re-checks the rules with code that shares nothing with the validation script (a test enforces this), plus official FHIR R4 schema validation. **This is the score to report**, because the script's own pass rate is partly guaranteed by its repairs.
+4. **Statistics** (`stats.py`): exact one-sided binomial test against H0, Wilson CIs, McNemar's exact test (before vs after), paired t-test on the conformance score, and the sample size needed for 80% power.
+5. **Demographic fidelity** (`fidelity.py`): compares the requested mix with the generated and delivered mix, by group, with CIs. Dropping failed records can shift the mix; this check makes that visible.
+6. **Export** (`runner.py`): each run is saved in `data/testdata/<run_id>/`. From there you can download a zip (FHIR NDJSON, HL7 v2 messages, spec, report), **use it as the training dataset**, or **send it to the HL7 listener**.
+
+| Check | What it verifies | Repair |
+|---|---|---|
+| V01 | One Patient with id, gender, birthDate; age within the cohort range | none |
+| V02 | Synthetic identifier (PHI guard) and HTEST label | add HTEST label (only if the identifier is present) |
+| V03 | Every reference resolves inside the bundle | drop optional dangling references |
+| V04 | US Core required elements | set Observation.category from its LOINC code |
+| V05 | LOINC, SNOMED/ICD-10-CM, RxNorm codes; UCUM units | `percent` → UCUM `%` |
+| V06 | HbA1c 3–16%, BMI 10–80 | none |
+| V07 | Periods ordered; dates between birth and the as-of date | swap reversed periods |
+| V08 | Minimum HbA1c and BMI results per patient | none |
+| V09 | Race/ethnicity and language recorded (warning only) | none |
+
+Differences from the reference project: there's no Java/Synthea dependency (Synthea can't target an exact demographic mix), it runs locally instead of as Databricks jobs and dashboards, and checks and resources are limited to the diabetes scope.
 
 ## FHIR versions
 
@@ -148,5 +185,8 @@ src/
   app.py                   FastAPI (REST + FHIR + HL7 inbox; starts listener)
 interface/frontend.py      Streamlit dashboard
 samples/                   example FHIR Bundles (all versions) and HL7 messages
-tests/                     65 tests: quality, routing, FHIR, HL7, end-to-end
+  testdata/                Synthetic Test Data Creator: spec, generator, validation,
+                           audit, stats, fidelity, runner, CLI
+interface/testdata_tab.py  Test Data Creator tab
+tests/                     83 tests: quality, routing, FHIR, HL7, test data, end-to-end
 ```

@@ -37,12 +37,16 @@ def age_on(birth_date: str, on: date):
 
 
 def _observation_value(observations: list[dict], loinc_code: str):
+    """Most recent value for a LOINC code (records can hold a series of results)."""
+    matches = []
     for obs in observations:
         codes = {c.get("code") for c in obs.get("code", {}).get("coding", []) if c.get("system") == t.LOINC}
         if loinc_code in codes and obs.get("status") not in ("entered-in-error", "cancelled"):
-            value = obs.get("valueQuantity", {}).get("value")
-            return value, obs.get("effectiveDateTime")
-    return None, None
+            matches.append((obs.get("effectiveDateTime") or "", obs))
+    if not matches:
+        return None, None
+    when, obs = max(matches, key=lambda m: m[0])
+    return obs.get("valueQuantity", {}).get("value"), when or None
 
 
 def bundle_to_record(bundle: dict) -> dict:

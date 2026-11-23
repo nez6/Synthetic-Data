@@ -1,9 +1,12 @@
 PY ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
 
-.PHONY: install data train run api ui listener send mlflow samples test
+.PHONY: install testdata data train run api ui listener send mlflow samples test
 
 install:
 	$(PY) -m pip install -r requirements.txt
+
+testdata:    ## Synthetic Test Data Creator (balanced preset, 500 patients)
+	$(PY) -m src.testdata.cli --n 500
 
 data:        ## generate synthetic patients and export FHIR Bundles
 	$(PY) -m src.data_ingestion

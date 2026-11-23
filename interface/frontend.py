@@ -30,6 +30,7 @@ from src.hl7v2 import message as hl7  # noqa: E402
 from src.hl7v2.mllp import is_listening, send  # noqa: E402
 from src.preprocess import flatten_bundles  # noqa: E402
 from src.quality import ISSUE_LABELS, score_dataframe  # noqa: E402
+from interface.testdata_tab import render as render_testdata  # noqa: E402
 
 CONFIG = load_config()
 SERIES = "#2a78d6"
@@ -134,7 +135,7 @@ with st.sidebar:
 
 st.title("📋 EHR Decision Support: Data Quality + Clinician Routing")
 
-tabs = st.tabs(["🧭 How it works", "1️⃣ Data", "2️⃣ Train", "3️⃣ Predict",
+tabs = st.tabs(["🧭 How it works", "🧬 Test Data Creator", "1️⃣ Data", "2️⃣ Train", "3️⃣ Predict",
                 "4️⃣ FHIR versions", "5️⃣ HL7 v2 listener"])
 
 
@@ -187,6 +188,7 @@ digraph {
         """
 | Tab | What you do | What you learn |
 |---|---|---|
+| **🧬 Test Data Creator** | Enter key demographics (age, sex, race/ethnicity, language, state, diabetes control) and fault rates; generate, validate and statistically accept a test-patient set, then export it or use it as training data | How to build trustworthy test data, and whether dropping bad records shifts the demographic mix |
 | **1 · Data** | Generate synthetic patients and browse them as a table, as FHIR, and as the scored training table | How EHR data becomes FHIR, and where it is incomplete |
 | **2 · Train** | Click **Train** and see accuracy, fairness by group and the quality report | How data quality affects what the model learns |
 | **3 · Predict** | Enter a patient; the app builds a FHIR Bundle and sends it to the API | What the model and routing rules return |
@@ -224,10 +226,18 @@ digraph {
         )
 
 
-# ============================================================================ 1. Data
+# ============================================================================ Test Data Creator
 
 with tabs[1]:
+    render_testdata()
+
+
+# ============================================================================ 1. Data
+
+with tabs[2]:
     st.subheader("Step 1 · Generate and explore the data")
+    st.caption("Want to choose the demographics yourself? Use the **🧬 Test Data Creator** tab, then "
+               "**Use as the training dataset**; it replaces the data shown here.")
     explain("The app creates synthetic patients, the way a hospital EHR would hold them, and exports "
             "each one as a **FHIR R4 Bundle**. Problems are injected on purpose: about 5% have no race/ethnicity, "
             "~3% have no BMI, and ~2% have an impossible HbA1c of 99%. "
@@ -334,7 +344,7 @@ with tabs[1]:
 
 # ============================================================================ 2. Train
 
-with tabs[2]:
+with tabs[3]:
     st.subheader("Step 2 · Train the models")
     explain("Training reads the FHIR Bundles, extracts the features, scores each record's quality, **drops records "
             "below the quality threshold**, fills small gaps (missing race → an explicit 'Unknown' group, never "
@@ -410,7 +420,7 @@ with tabs[2]:
 
 # ============================================================================ 3. Predict
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("Step 3 · Predict for one patient")
     explain("Enter a patient. The app builds a **FHIR Bundle** in the version you choose and POSTs it to the API at "
             "`/fhir/{version}/Bundle/$predict`. The API validates it, scores its quality, runs both models and "
@@ -457,7 +467,7 @@ with tabs[3]:
 
 # ============================================================================ 4. FHIR versions
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Step 4 · The same patient in five FHIR versions")
     explain("FHIR has had several major releases. Each one renamed or restructured some elements, which is why an "
             "integration built for one version can break on another. Pick a patient and two versions to see "
@@ -525,7 +535,7 @@ with tabs[4]:
 
 # ============================================================================ 5. HL7 v2
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Step 5 · Receive lab results over HL7 v2")
     explain(f"Most lab systems still send results as **HL7 v2 ORU^R01** messages over **MLLP** (TCP). This app runs "
             f"an MLLP **listener on {HL7_HOST}:{HL7_PORT}** inside the API. For each message it: parses the segments → "
