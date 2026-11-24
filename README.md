@@ -91,7 +91,7 @@ make mlflow        # http://localhost:5000
 ## Setup and usage (local)
 
 ```bash
-git clone https://github.com/nez6/Diabetes-Project-.git && cd Diabetes-Project-
+git clone https://github.com/nez6/Synthetic-Data.git && cd Synthetic-Data
 python3 -m venv .venv && source .venv/bin/activate
 make install          # pip install -r requirements.txt
 make data-download    # 00 · fetch + verify the Synthea pools from Google Cloud Storage
