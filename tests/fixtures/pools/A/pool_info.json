@@ -1,0 +1,38 @@
+{
+ "name": "A",
+ "synthea_version": "v4.0.0",
+ "chunks": [
+  {
+   "chunk": 0,
+   "seed": 20261102,
+   "population": 100,
+   "files": 104,
+   "command": [
+    "-p",
+    "100",
+    "-a",
+    "18-64",
+    "-s",
+    "20261102",
+    "-cs",
+    "20261102",
+    "-r",
+    "20261123",
+    "--exporter.baseDirectory=/Users/nataliezachariah/Documents/GitHub/diabetes-demographic-plan-router/data/pools/A/_tmp",
+    "--exporter.years_of_history=10",
+    "--exporter.fhir.export=true",
+    "--exporter.hospital.fhir.export=false",
+    "--exporter.practitioner.fhir.export=false",
+    "--exporter.csv.export=false",
+    "Massachusetts"
+   ],
+   "generated_at": "2026-11-24T00:46:57+00:00"
+  }
+ ],
+ "min_age": 18,
+ "max_age": 64,
+ "years_of_history": 10,
+ "state": "Massachusetts",
+ "as_of": "2026-11-23",
+ "jar_sha256": "ed43c20ad40ba5c3bc724503a5af032715fe3c491620b766148e7c2361e6ecc1"
+}

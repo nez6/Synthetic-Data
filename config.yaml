@@ -1,52 +1,79 @@
-pipeline:
-  project_name: "diabetes_demographic_plan_router"
-  test_size: 0.2
+# Synthetic Test Data Creator — pipeline configuration.
+# Cohort-specific inputs (demographics, fault rates) come from the UI, the API or a profile;
+# this file holds everything that is fixed per deployment.
+
+project:
+  name: "synthetic-test-data-creator"
+  mlflow_experiment: "synthetic_test_data_ml"
   random_state: 42
-  n_samples: 1200
 
-data:
-  # Step 1: synthetic "source EHR" table (what the hospital system knows)
-  source_path: "data/source_ehr_records.csv"
-  # Step 2: the same patients exported as FHIR Bundles, one JSON per line (this is the training input)
-  fhir_version: "R4"
-  bundles_path: "data/fhir/bundles.ndjson"
-  # Step 3: Bundles flattened back into a table + Data Quality Index
-  flattened_path: "data/fhir_flattened_with_dqi.csv"
-  target_medication: "recommended_medication_plan"
-  target_meal: "recommended_meal_plan"
-  unknown_race_label: "Unknown"
+# Step 00 · where the dataset (the Synthea pools) is hosted. `python -m src.cloud_data download`
+# fetches it; the Docker image does this on first start. DATA_BUCKET overrides the bucket.
+cloud:
+  provider: "Google Cloud Storage"
+  bucket: "stdc-13890-data"
+  prefix: "synthea-pools/v1"
+  public_base_url: "https://storage.googleapis.com"
 
-model:
-  type: "RandomForestClassifier"
-  n_estimators: 100
+paths:
+  runs_dir: "data/runs"                # one folder per dataset run
+  hl7_inbox_db: "data/hl7_inbox.db"
+  profile_script: "tools/data_quality_profile.py"
 
-# Data Quality Index (DQI) — each record starts at 100.
-quality_weights:
-  missing_race_penalty: 25        # no us-core-race / us-core-ethnicity extension (FHIR) or empty PID-10/22 (HL7)
-  missing_bmi_penalty: 25         # no Observation with LOINC 39156-5 / no BMI OBX
-  out_of_bounds_bmi_penalty: 25
-  missing_age_penalty: 25         # no Patient.birthDate / empty PID-7
-  out_of_bounds_hba1c_penalty: 50 # missing, or outside plausible bounds (LOINC 4548-4)
+privacy:
+  k_min_cell_size: 11                  # smallest count a profile may report (small-cell suppression)
 
+# Plausibility bounds used by the validation script, the audit and the record-level quality score
 quality_bounds:
-  hba1c_min: 3.0
-  hba1c_max: 16.0
-  bmi_min: 10.0
-  bmi_max: 80.0
+  bmi: [10, 80]
+  systolic_bp: [60, 260]
+  hba1c: [3, 16]
+  egfr: [1, 200]
 
-# Records scoring below this are excluded from training (and flagged at prediction time).
-min_quality_threshold: 75
+# Record-level Data Quality Index (single records arriving via HL7 or FHIR)
+quality_weights:
+  missing_race_ethnicity: 15
+  missing_birthdate: 25
+  missing_sex: 10
+  missing_lab: 10                      # per missing vital/lab
+  implausible_lab: 25                  # per implausible vital/lab
+
+acceptance:
+  h0_rate: 0.85                        # H0: independent pass rate <= this
+  target_rate: 0.90
+  alpha: 0.05
+
+ml:
+  # Step 03 ("Each cohort is split 60/20/20 to train the model"). The model sees demographics only
+  # (age, sex, race/ethnicity, cohort) and predicts whether a record passes validation.
+  # The split is per cohort and can be overridden per request.
+  split: {train: 0.6, test: 0.2, validation: 0.2}   # train fits · test tunes · validation = final score
+  candidates: "logistic regression (C 0.1/1/10), random forest (depth 3/6); best ROC AUC on the test split"
 
 hl7:
   host: "127.0.0.1"
-  port: 2575                      # standard MLLP port
-  start_with_api: true            # the FastAPI process also runs the MLLP listener
-  inbox_db: "data/hl7_inbox.db"
+  port: 2575                           # standard MLLP port
+  start_with_api: true                 # the API process also runs the MLLP listener
 
-artifacts:
-  model_dir: "models"
-  med_model_path: "models/medication_model.pkl"
-  meal_model_path: "models/meal_model.pkl"
-  encoder_path: "models/label_encoders.pkl"
-  quality_report_path: "models/quality_report.json"
-  training_summary_path: "models/training_summary.json"
+# ---------------------------------------------------------------- Synthea (step 02)
+synthea:
+  version: "v4.0.0"
+  jar: ".tools/synthea-v4.0.0.jar"           # sha256 ed43c20a... (same build as the reference project)
+  java: ".tools/jre/Contents/Home/bin/java"  # falls back to `java` on PATH
+  state: "Massachusetts"
+  chunk_size: 100                            # patients per Synthea call; raw output is deleted after each chunk
+  pools_dir: "data/pools"
+  # Resource types kept from Synthea output (billing, provenance, imaging, documents are dropped)
+  keep_types: [Patient, Encounter, Condition, AllergyIntolerance, MedicationRequest, MedicationStatement,
+               Medication, Observation, Procedure, Immunization, DiagnosticReport, CarePlan, CareTeam]
+  pools:
+    A: {population: 600, min_age: 18, max_age: 64, years_of_history: 10, seed: 20261102}  # 10 yrs: enough immunization history; validation trims to the most recent care
+    B: {population: 2500, min_age: 50, max_age: 90, years_of_history: 10, seed: 20261103}
+
+# Chronic condition groups (SNOMED CT + ICD-10-CM prefixes), as in the reference project
+condition_groups:
+  chf: {snomed: ["88805009", "84114007", "42343007", "703272007"], icd10_prefixes: ["I50"]}
+  ckd_esrd: {snomed: ["46177005", "431855005", "431856006", "433144002", "431857002", "709044004", "127013003"],
+             icd10_prefixes: ["N18", "E11.2"]}
+  t2d: {snomed: ["44054006"], icd10_prefixes: ["E11"]}
+  copd: {snomed: ["185086009", "87433001", "13645005"], icd10_prefixes: ["J43", "J44"]}

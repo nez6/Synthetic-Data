@@ -1,5 +1,0 @@
-MSH|^~\&|LAB_SYS|CLINIC|DQI_ROUTER|DIABETES_PROJECT|20261122034220||ORU^R01^ORU_R01|SAMPLE0001|P|2.5.1
-PID|1||pt-sample^^^CLINIC^MR||Synthetic^Patient pt-sample||19740502|F||2054-5^Black or African American^CDCREC||||||||||||2186-5^Not Hispanic or Latino^CDCREC
-OBR|1|||4548-4^Hemoglobin A1c/Hemoglobin.total in Blood^LN|||20260304103000
-OBX|1|NM|4548-4^Hemoglobin A1c/Hemoglobin.total in Blood^LN||9.8|%^percent^UCUM|4.0-5.6|H|||F|||20260304103000
-OBX|2|NM|39156-5^Body mass index (BMI) [Ratio]^LN||31.2|kg/m2^^UCUM|||||F|||20260304103000

@@ -4,12 +4,12 @@ VERSIONS = {
     "DSTU2": {"fhirVersion": "1.0.2", "released": "2015",
               "notes": "First widely deployed release. US data used the Argonaut profiles."},
     "STU3": {"fhirVersion": "3.0.2", "released": "2017",
-             "notes": "US Core replaces Argonaut. CarePlan gains 'intent'. Observation.context appears."},
+             "notes": "US Core replaces Argonaut. Many single fields become lists. Observation.context appears."},
     "R4": {"fhirVersion": "4.0.1", "released": "2019",
            "notes": "First 'normative' release; the version US regulation (ONC Cures Act) requires today."},
     "R4B": {"fhirVersion": "4.3.0", "released": "2022",
             "notes": "Interim release. Changes are in medication-definition resources; "
-                     "Patient/Observation/Encounter/CarePlan are identical to R4."},
+                     "Patient/Observation/Encounter/Condition are identical to R4."},
     "R5": {"fhirVersion": "5.0.0", "released": "2023",
            "notes": "Latest release. Encounter was substantially redesigned."},
 }
@@ -71,9 +71,24 @@ DIFFERENCES = [
         "DSTU2": "period", "STU3": "period", "R4": "period", "R4B": "period", "R5": "actualPeriod",
     },
     {
-        "element": "CarePlan.intent",
-        "why": "Added in STU3 (required) to separate proposals, plans and orders.",
-        "DSTU2": "(does not exist)", "STU3": "plan", "R4": "plan", "R4B": "plan", "R5": "plan",
+        "element": "Condition → Patient link",
+        "why": "Renamed so a Condition can be recorded against a Group as well as a Patient.",
+        "DSTU2": "patient", "STU3": "subject", "R4": "subject", "R4B": "subject", "R5": "subject",
+    },
+    {
+        "element": "Condition.clinicalStatus / verificationStatus",
+        "why": "R4 turned plain codes into CodeableConcepts so they can carry a code system.",
+        "DSTU2": "plain codes", "STU3": "plain codes",
+        "R4": "CodeableConcept (terminology.hl7.org)", "R4B": "CodeableConcept (terminology.hl7.org)",
+        "R5": "CodeableConcept (terminology.hl7.org)",
+    },
+    {
+        "element": "Condition.category",
+        "why": "Became a list in STU3 ('diagnosis' → 'problem-list-item'); code system moved in R4.",
+        "DSTU2": "single object, 'diagnosis'", "STU3": "list, hl7.org/fhir/condition-category",
+        "R4": "list, terminology.hl7.org/CodeSystem/condition-category",
+        "R4B": "list, terminology.hl7.org/CodeSystem/condition-category",
+        "R5": "list, terminology.hl7.org/CodeSystem/condition-category",
     },
     {
         "element": "Bundle.timestamp",
