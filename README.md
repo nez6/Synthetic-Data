@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Live front end** | _STREAMLIT_URL_ |
+| **Live front end** | https://synthetic-data-ge.streamlit.app/ |
 | **Live API** | https://stdc-api-ex2qikv6gq-ue.a.run.app ([interactive docs](https://stdc-api-ex2qikv6gq-ue.a.run.app/docs)) |
 | **Dataset in the cloud** | [`gs://stdc-13890-data/synthea-pools/v1`](https://storage.googleapis.com/stdc-13890-data/synthea-pools/v1/manifest.json) (public, Google Cloud Storage) |
 
