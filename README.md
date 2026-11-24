@@ -1,192 +1,202 @@
-# Diabetes Demographic Plan Router
+# Synthetic Test Data Creator
 
-An end-to-end interoperability and ML pipeline for type 2 diabetes care. Patient data comes in as **FHIR** (five versions supported) or as **HL7 v2** lab messages over an **MLLP listener**. Every record is scored with a **Data Quality Index (DQI)**. Two models then recommend a medication plan and a meal plan, and a rule layer routes the patient to the right clinician.
+**Request a synthetic FHIR patient dataset that matches your population, validate it, train a model on it, and pull it from a deployed API.**
 
-> ⚠️ All data is synthetic. This is a teaching and demonstration project, not a medical device.
+| | |
+|---|---|
+| **Live front end** | _STREAMLIT_URL_ |
+| **Live API** | https://stdc-api-ex2qikv6gq-ue.a.run.app ([interactive docs](https://stdc-api-ex2qikv6gq-ue.a.run.app/docs)) |
+| **Dataset in the cloud** | [`gs://stdc-13890-data/synthea-pools/v1`](https://storage.googleapis.com/stdc-13890-data/synthea-pools/v1/manifest.json) (public, Google Cloud Storage) |
 
-## Quickstart
+> All patients are synthetic (Synthea) and carry the HL7 `HTEST` security label. This is a teaching project, not a medical device.
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-make install
-make run        # API :8000 + HL7 MLLP listener :2575 + dashboard :8501
+Module Project 3 (Data/ML Engineering): a reproducible ML pipeline with cloud data storage, MLflow tracking, a Docker image, an API on Google Cloud Run and a Streamlit front end that calls it.
+
+## Overview and goals
+
+Healthcare teams need realistic test data that looks like *their* patients and *their* data-quality problems, without touching real records. This app:
+
+1. **Profiles your data without sharing it.** You download `data_quality_profile.py`, run it on your own FHIR export and upload the resulting `profile.json`. It holds aggregate counts only, and small cells are suppressed.
+2. **Selects matching Synthea patients.** It picks patients from pre-built pools by cohort and demographic quota, then injects your data-quality faults at your rates.
+3. **Validates and repairs them.** Checks V01–V08 cover US Core, references, codes, dates and resource volumes. An independent audit and a statistical acceptance test follow.
+4. **Trains a model.** It splits the data 60/20/20 and learns whether a record passes validation from **demographics only**.
+5. **Delivers the dataset.** You get HTEST-labelled FHIR R4 (NDJSON), CSV, a zip with HL7 v2 messages, or one patient in any FHIR version.
+
+```
+GCS bucket ──download──▶ Synthea pools ─▶ select (cohort + demographic quota) ─▶ inject faults
+   (00)                     (02)                                                      │
+profile.json (01) ───────────────────────────────────────────────────────────────────┘
+                                   ▼
+                     validate + repair, audit (03) ─▶ ML 60/20/20 + MLflow ─▶ model_*.pkl
+                                   ▼                                              ▼
+                       delivery set (04)  ◀──────────  FastAPI on Cloud Run  ──▶ /predict
+                                                         ▲
+                                     Streamlit front end (Streamlit Community Cloud)
 ```
 
-Open http://localhost:8501 and work through the tabs in order:
+## Dataset
 
-| Tab | What you do |
+- **Source:** [Synthea](https://synthea.mitre.org) v4.0.0 ([GitHub](https://github.com/synthetichealth/synthea)), MITRE's open-source synthetic patient generator (Apache 2.0). We ran it with fixed seeds, Massachusetts demographics and 10 years of history.
+- **Pools:** Pool **A** has 639 people aged 18–64 (seed 20261102). Pool **B** has 2,478 people aged 50–90 (seed 20261103). Each patient is one FHIR R4 Bundle, compacted to the clinical resource types in `config.yaml → synthea.keep_types`.
+- **Cleaning:** Synthea writes about 9 MB per older patient, mostly billing resources. `src/pools.py` drops resource types we don't use, removes references that would dangle, and gzips each bundle.
+- **Hosting:** each pool is a tar.gz in a public Google Cloud Storage bucket, next to `manifest.json` with SHA-256 checksums. `src/cloud_data.py` downloads and verifies them; that's step 00 of the pipeline.
+
+## The ML task
+
+| | |
 |---|---|
-| 🧭 **How it works** | Read the architecture, the DQI rules, the routing rules and a glossary |
-| 🧬 **Test Data Creator** | Enter key demographics and fault rates, then generate, validate and statistically accept a set of test patients. Download it, train on it or send it over HL7 |
-| 1️⃣ **Data** | Generate synthetic patients. View them as the source EHR table, as FHIR Bundles, and as the flattened training table with DQI. See quality broken down by demographic group |
-| 2️⃣ **Train** | Pick a quality threshold and train. See accuracy by group, feature importance, the confusion matrix and the MLflow run history |
-| 3️⃣ **Predict** | Enter a patient. The app builds a FHIR Bundle in the version you choose and calls `/fhir/{version}/Bundle/$predict` |
-| 4️⃣ **FHIR versions** | Compare one patient across DSTU2, STU3, R4, R4B and R5, with schema validation and a line-by-line diff |
-| 5️⃣ **HL7 v2 listener** | Compose an ORU^R01, send it over MLLP and read the ACK. Inspect the inbox: raw HL7 → FHIR R4 → prediction |
+| Task | Binary classification: does a patient record pass validation? |
+| Features | `age`, `sex`, `race_ethnicity`, `cohort` (demographics only; the model never sees clinical values) |
+| Targets | `passed_before` (**raw** model, data as generated) and `passed_after` (**validated** model, data as delivered) |
+| Split | Per cohort: 60% train, 20% test (hyperparameter choice), 20% validation (final score). Ratios are set in `config.yaml → ml.split`, or per request |
+| Candidates | Logistic regression (C = 0.1, 1, 10) and random forest (depth 3, 6; 200 trees), with one-hot encoding plus scaling or imputation |
+| Selection metric | ROC AUC on the test split |
+| Reported | Accuracy, balanced accuracy, ROC AUC and predicted vs actual pass rate on the validation split, plus permutation importance per feature |
 
-Command-line equivalents: `make testdata`, `make data`, `make train`, `make send`, `make mlflow`, `make test`.
+**Why demographics only?** If a demographic group fails validation more often, a model trained on demographics can learn it. An ROC AUC well above 0.5 is a warning that data quality depends on who the patient is.
 
-## Architecture
+**Results from the default request** (363 cohort A patients and 132 cohort B patients tested):
 
-```mermaid
-flowchart LR
-    EHR[Synthetic EHR<br/>source records] -->|export| FHIR[FHIR Bundles<br/>Patient · Encounter ·<br/>Observation · CarePlan]
-    FHIR --> FLAT[Flatten to features<br/>fhir/parser.py]
-    FLAT --> DQI[Data Quality Index<br/>quality.py]
-    DQI -->|drop DQI below 75| TRAIN[Train 2× RandomForest<br/>train.py]
-    TRAIN --> MLF[(MLflow)]
-    TRAIN --> MOD[(models/)]
-    LAB[Lab system] -->|HL7 v2 ORU^R01<br/>over MLLP :2575| LIS[MLLP listener<br/>hl7v2/listener.py]
-    LIS -->|convert to FHIR R4| INF
-    CLIENT[FHIR client<br/>any version] -->|POST /fhir/v/Bundle/$predict| INF[inference.py<br/>DQI + models + routing]
-    MOD --> INF
-    LIS -->|ACK AA/AE/AR| LAB
-    INF --> OUT[Medication plan · meal plan ·<br/>clinician routing]
-    LIS --> INBOX[(HL7 inbox<br/>SQLite)]
-```
-
-### Pipeline steps
-
-1. **Ingestion** (`src/data_ingestion.py`): generates 1,200 patients and exports each as a FHIR Bundle in `data/fhir/bundles.ndjson`. Faults are injected on purpose: about 5% have no race or ethnicity, 40 have no BMI Observation, and 20 have an implausible HbA1c of 99%.
-2. **Flatten** (`src/fhir/parser.py`): pulls features out of each Bundle. Race and ethnicity come from the US Core extensions, BMI from LOINC 39156-5, HbA1c from LOINC 4548-4, age from `birthDate`, and the labels from `CarePlan.description`.
-3. **Data Quality** (`src/quality.py`): see the rules below. Records scoring under 75 are excluded from training. Missing race becomes an explicit `Unknown` group, never a guessed race.
-4. **Training** (`src/train.py`): trains two Random Forests. Parameters, accuracy, accuracy per demographic group, DQI per group and the quality report are all logged to MLflow.
-5. **Serving** (`src/app.py`): plain JSON, FHIR in any version, and HL7 v2 all reach the same `inference.predict()`.
-
-### Data Quality Index
-
-| Check | FHIR source | HL7 v2 source | Penalty |
-|---|---|---|---|
-| Race/ethnicity not recorded | `us-core-race` / `us-core-ethnicity` extension | PID-10 / PID-22 | −25 |
-| BMI missing | Observation LOINC 39156-5 | OBX 39156-5 | −25 |
-| BMI outside 10–80 | `valueQuantity` | OBX-5 | −25 |
-| Birth date missing | `Patient.birthDate` | PID-7 | −25 |
-| HbA1c missing or outside 3–16% | Observation LOINC 4548-4 | OBX 4548-4 | −50 |
-
-### Clinician routing
-
-| Condition | Specialty | Urgency |
-|---|---|---|
-| HbA1c ≥ 9.5% | Endocrinology & Metabolic Specialist | High |
-| Combination therapy predicted, or BMI > 32 | Internal Medicine + Registered Dietitian | Routine |
-| Everyone else | Primary Care + Behavioral Health Coach | Preventative |
-
-## Synthetic Test Data Creator
-
-This is a version of [zachana-1/Synthetic-Test-Data-Creator](https://github.com/zachana-1/Synthetic-Test-Data-Creator) adapted to this project. Instead of fixed Synthea cohorts, you define the cohort by its **key demographics** in the dashboard (🧬 tab) or in a JSON spec (`python -m src.testdata.cli --spec cohort.json`).
-
-| Input | Options |
-|---|---|
-| Cohort | number of patients, random seed, age range, % female, states |
-| Race / ethnicity mix | AIAN, Asian, Black/African American, White, Hispanic/Latino, not recorded |
-| Preferred language | English, Spanish, Vietnamese, Chinese, not recorded |
-| Clinical profile | diabetes control mix (HbA1c below 7, 7–9, above 9), BMI mean/SD, years of history, visits per year |
-| Faults to inject | missing BMI, implausible HbA1c, missing birth date (⛔ not repairable); non-UCUM unit, missing Observation category, reversed period, dangling reference, missing HTEST label (🔧 repairable) |
-| Acceptance | H0 pass rate (85%), target (90%), alpha, minimum HbA1c and BMI results per patient |
-
-**Pipeline** (`src/testdata/`):
-
-1. **Generate** (`generator.py`): writes US Core R4 Bundles with a Patient, Practitioner, T2D Condition (SNOMED + ICD-10-CM), Encounters, a series of HbA1c and BMI Observations (LOINC, UCUM), MedicationRequests (RxNorm, matched to the care tier) and CarePlans. Demographics are assigned by quota, so the generated mix matches the request exactly. Every Patient carries a synthetic identifier and the HL7 `HTEST` security label.
-2. **Validate and repair** (`validation.py`): runs checks V01–V09. Repairs are made only when the fix is certain. Nothing is invented: a record that is missing data, or has an implausible lab value, stays failed. A record without the synthetic identifier could be real data, so it is never modified.
-3. **Independent audit** (`audit.py`): re-checks the rules with code that shares nothing with the validation script (a test enforces this), plus official FHIR R4 schema validation. **This is the score to report**, because the script's own pass rate is partly guaranteed by its repairs.
-4. **Statistics** (`stats.py`): exact one-sided binomial test against H0, Wilson CIs, McNemar's exact test (before vs after), paired t-test on the conformance score, and the sample size needed for 80% power.
-5. **Demographic fidelity** (`fidelity.py`): compares the requested mix with the generated and delivered mix, by group, with CIs. Dropping failed records can shift the mix; this check makes that visible.
-6. **Export** (`runner.py`): each run is saved in `data/testdata/<run_id>/`. From there you can download a zip (FHIR NDJSON, HL7 v2 messages, spec, report), **use it as the training dataset**, or **send it to the HL7 listener**.
-
-| Check | What it verifies | Repair |
-|---|---|---|
-| V01 | One Patient with id, gender, birthDate; age within the cohort range | none |
-| V02 | Synthetic identifier (PHI guard) and HTEST label | add HTEST label (only if the identifier is present) |
-| V03 | Every reference resolves inside the bundle | drop optional dangling references |
-| V04 | US Core required elements | set Observation.category from its LOINC code |
-| V05 | LOINC, SNOMED/ICD-10-CM, RxNorm codes; UCUM units | `percent` → UCUM `%` |
-| V06 | HbA1c 3–16%, BMI 10–80 | none |
-| V07 | Periods ordered; dates between birth and the as-of date | swap reversed periods |
-| V08 | Minimum HbA1c and BMI results per patient | none |
-| V09 | Race/ethnicity and language recorded (warning only) | none |
-
-Differences from the reference project: there's no Java/Synthea dependency (Synthea can't target an exact demographic mix), it runs locally instead of as Databricks jobs and dashboards, and checks and resources are limited to the diabetes scope.
-
-## FHIR versions
-
-The builder (`src/fhir/builder.py`) can write the same patient in **DSTU2, STU3, R4, R4B and R5**. The parser reads all five and can tell which version a Bundle is from its structure (`detect_version`). STU3, R4B and R5 output is checked against the official schemas with [`fhir.resources`](https://pypi.org/project/fhir.resources/). R4 is checked with the R4B models, which are identical to R4 for the resources used here. DSTU2 has no maintained schema library, so it isn't schema-checked. Example files are in [`samples/fhir/`](samples/fhir).
-
-| Element | DSTU2 | STU3 | R4 / R4B | R5 |
+| Model | Chosen | Validation accuracy | Balanced accuracy | ROC AUC |
 |---|---|---|---|---|
-| Race/ethnicity extension | `argo-race` (Argonaut) | `us-core-race` | `us-core-race` | `us-core-race` |
-| `Observation.category` | single object, `hl7.org/fhir/…` | list, `hl7.org/fhir/…` | list, `terminology.hl7.org/…` | same as R4 |
-| Observation → Encounter | `encounter` | `context` | `encounter` | `encounter` |
-| Observation note | `comments` | `comment` | `note[]` (Annotation) | `note[]` |
-| Encounter → Patient | `patient` | `subject` | `subject` | `subject` |
-| `Encounter.class` | code | Coding | Coding (`terminology.hl7.org`) | list of CodeableConcept |
-| Completed visit status | `finished` | `finished` | `finished` | `completed` |
-| Encounter time span | `period` | `period` | `period` | `actualPeriod` |
-| `CarePlan.intent` | n/a | `plan` | `plan` | `plan` |
-| `Bundle.timestamp` | n/a | n/a | present | present |
+| Raw (before validation) | constant "fail" | 100% | n/a | n/a |
+| Validated (after validation) | random forest, depth 3 | 90.0% | 86.5% | 0.901 |
 
-The tests confirm that a Bundle built for one version fails the schema of another, for example R4 checked as R5 or STU3 checked as R4.
+**What the difference means:**
+- **Raw model:** every raw Synthea record fails at least one check, so there's nothing to learn and the model predicts the constant "fail".
+- **Validated model:** after validation, 91% of cohort A passes but only 11% of cohort B does. Cohort B patients are older, have complex care and have more resources than the targets allow. So the model predicts mostly from `cohort` and `age`, which shows up in the ML tab's importance chart.
 
-## HL7 v2 listener
+That finding is about the data, not about the model: the cohort B targets are hard to meet. The assignment doesn't grade the model's accuracy, so it's kept simple.
 
-The API process also runs an **MLLP listener on `127.0.0.1:2575`**. You can turn this off with `hl7.start_with_api` in `config.yaml`, or run it on its own with `make listener`. For each message it:
+## Experiment tracking (MLflow)
 
-1. Removes the MLLP framing (`0x0B … 0x1C 0x0D`) and splits the message into segments.
-2. Accepts only **ORU^R01**. Any other type gets an `AR` (reject) ACK.
-3. Maps the fields: PID-3 is the MRN, PID-7 the birth date, PID-10 race and PID-22 ethnicity (CDC codes), and OBX the LOINC results. It then builds a **FHIR R4 Bundle**.
-4. Scores the DQI, predicts and routes, stores everything in `data/hl7_inbox.db`, and replies with an `AA` ACK. If the model isn't trained yet, it replies `AE`.
+Every run logs to the MLflow experiment `synthetic_test_data_ml`:
+- **Parent run:** request name, delivery size, features, split ratios and patients per cohort; final and baseline pass rates per cohort; and the artifacts `pass_rates.png`, `ml_report.json` and `ml_dataset.csv`.
+- **Nested runs `raw` and `validated`:** target, chosen model and its hyperparameters; accuracy, balanced accuracy and ROC AUC on the train, test and validation splits; and the pickled model.
 
 ```bash
-make send                                         # 5 random patients
-python -m src.hl7v2.send --file samples/hl7/oru_r01.hl7
-python -m src.hl7v2.send --file samples/hl7/oru_r01_missing_data.hl7
+make mlflow        # http://localhost:5000
 ```
+
+## Cloud services used
+
+| Service | Used for |
+|---|---|
+| **Google Cloud Storage** (`gs://stdc-13890-data`) | Hosts the cleaned dataset (Synthea pools + checksum manifest), public-read |
+| **Google Cloud Build** | Builds the Docker image from this repo on `gcloud run deploy --source .` |
+| **Google Artifact Registry** | Stores the built image |
+| **Google Cloud Run** (`stdc-api`, us-east1) | Runs the API container, publicly accessible |
+| **Streamlit Community Cloud** | Hosts the front end; it calls the Cloud Run API over HTTPS (`API_URL` secret) |
+
+## Setup and usage (local)
+
+```bash
+git clone https://github.com/nez6/Diabetes-Project-.git && cd Diabetes-Project-
+python3 -m venv .venv && source .venv/bin/activate
+make install          # pip install -r requirements.txt
+make data-download    # 00 · fetch + verify the Synthea pools from Google Cloud Storage
+```
+
+### Train the model
+```bash
+make train            # = python -m src.pipeline train
+```
+This downloads the data if needed, then runs the default request: selection, validation, the 60/20/20 split, model training and MLflow logging. Results land in `data/runs/<run_id>/` (the `ml/` folder holds both models). To train on a custom request instead, use the **📝 Request** tab or `POST /runs`.
+
+### Build and test the API locally
+```bash
+make run              # API on :8000 (+ HL7 listener on :2575) and dashboard on :8501
+make test             # 63 tests: validation, FHIR versions, HL7, cloud download, API endpoints
+
+curl localhost:8000/health
+curl -X POST localhost:8000/predict -H 'content-type: application/json' \
+  -d '{"age": 72, "sex": "female", "race_ethnicity": "Hispanic/Latino", "cohort": "B"}'
+# → {"run_id": "...", "model": "validated", "probability_pass": 0.04, "predicted_pass": false, ...}
+```
+
+### Run everything in Docker
+```bash
+docker build -t stdc .
+docker run --rm -v "$PWD/data:/app/data" stdc train                 # training entry point
+docker run --rm -p 8080:8080 stdc serve                             # serving entry point → http://localhost:8080/docs
+docker run --rm -p 8501:8501 -e API_URL=http://host.docker.internal:8080 stdc ui   # front end
+```
+On first start, `serve` downloads the data from Cloud Storage and trains a model in the background. `/health` reports its progress (`bootstrap.stage`: downloading → training → ready).
+
+## Deploy to the cloud
+
+**1. Data (once, or after rebuilding the pools).** This needs `gcloud` signed in to a project with billing enabled.
+```bash
+gcloud storage buckets create gs://<bucket> --location us-east1 --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://<bucket> --member=allUsers --role=roles/storage.objectViewer
+make data-upload      # set cloud.bucket in config.yaml first
+```
+
+**2. API on Cloud Run.** This builds the Dockerfile with Cloud Build.
+```bash
+gcloud services enable run.googleapis.com storage.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com
+make deploy-api       # gcloud run deploy stdc-api --source . --region us-east1 --allow-unauthenticated \
+                      #   --memory 8Gi --cpu 2 --no-cpu-throttling --max-instances 1 --timeout 900
+curl -X POST https://<service-url>/predict -H 'content-type: application/json' -d '{"age": 45, "sex": "male", "cohort": "A"}'
+```
+- `--max-instances 1`: runs and jobs live in the container, so a single instance keeps them consistent.
+- `--no-cpu-throttling`: lets background runs keep working between requests.
+
+**3. Front end on Streamlit Community Cloud.**
+1. Go to [share.streamlit.io](https://share.streamlit.io) and choose **Create app**.
+2. Pick this repo and branch, with main file `interface/frontend.py`.
+3. Under **Advanced settings**, choose Python 3.12 and set the secret `API_URL = "https://<service-url>"`.
 
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Status, including whether the HL7 listener is up |
-| POST | `/predict` | Plain JSON input: `race_demographic`, `age`, `bmi`, `baseline_hba1c` |
-| GET | `/fhir/{version}/metadata` | CapabilityStatement for DSTU2, STU3, R4, R4B or R5 |
-| POST | `/fhir/{version}/Bundle/$predict` | FHIR Bundle in → validation, detected version, DQI, prediction |
-| POST | `/fhir/{version}/$convert` | Re-express a Bundle in another FHIR version |
-| GET | `/hl7/inbox` | Messages the listener has received |
+| POST | `/predict` | JSON `{age, sex, race_ethnicity, cohort, model?, run_id?}` → probability the record passes validation |
+| GET | `/health` | Pools, runs, start-up state, HL7 listener |
+| GET | `/tools/data_quality_profile.py` | Download the profiling script |
+| GET | `/requests/default` · POST `/requests/from-profile` | Default request / request filled from a profile |
+| POST | `/runs` → GET `/jobs/{id}` | Submit a request (runs in the background) and poll it |
+| GET | `/runs`, `/runs/{id}`, `/runs/{id}/full` | Results: cohort scores, checks, per-patient records, ML report |
+| GET | `/runs/{id}/dataset?format=ndjson\|csv\|zip` | Download the delivered dataset |
+| GET | `/runs/{id}/patients/{pid}?fhir_version=R5` | One delivered patient in DSTU2, STU3, R4, R4B or R5 |
+| GET | `/runs/{id}/plot.png`, `/runs/{id}/delivered-records`, `/runs/{id}/patients/{pid}/before-after` | Data for the dashboard |
+| POST | `/pools/eligible` · GET `/pools/profile` | Eligible patients per cohort / demo profile of the pools |
+| POST | `/hl7/send` · GET/DELETE `/hl7/inbox` | Relay an ORU^R01 to the MLLP listener over HTTPS; read or clear its inbox |
+| GET/POST | `/fhir/{version}/metadata`, `/fhir/{version}/$convert` | CapabilityStatement; convert a Bundle to another FHIR version |
 
-Interactive docs are at http://localhost:8000/docs.
-
-## Design notes and limitations
-
-- **Labels are clinical only.** Plans follow HbA1c thresholds (above 9.0 and above 7.5). The Train tab shows accuracy per group and feature importance, so you can check that demographic group isn't driving predictions.
-- **Accuracy is near 100%** because the labels follow a rule. Real EHR labels would be noisier. The project is about the pipeline and the quality monitoring.
-- **Hispanic/Latino is an ethnicity** in US Core and OMB standards, so it is written to `us-core-ethnicity` (PID-22), not the race extension. The model's single "demographic group" feature merges the two.
-- The HL7 parser handles the segments and fields this project uses. It isn't a general HL7 v2 engine: it doesn't handle escape sequences, repeating fields or Z-segments.
-
-## Project layout
+## Project structure
 
 ```
-config.yaml                pipeline, DQI weights, HL7 listener, artifact paths
+config.yaml                 pipeline configuration: cloud bucket, split ratios, quality bounds, acceptance, Synthea pools
+Dockerfile                  one image; entry points: train · serve · ui
+Makefile                    install · data-download · train · run · test · docker-* · deploy-api
 src/
-  data_ingestion.py        synthetic EHR → FHIR Bundles (NDJSON)
-  terminology.py           LOINC, UCUM, CDC race/ethnicity codes
-  fhir/builder.py          record → Bundle for DSTU2 | STU3 | R4 | R4B | R5
-  fhir/parser.py           Bundle (any version) → record; version detection
-  fhir/validate.py         official-schema validation (fhir.resources)
-  fhir/versions.py         version metadata + differences table
-  hl7v2/message.py         ORU^R01 build/parse, ACKs, field dictionary
-  hl7v2/mllp.py            MLLP framing, threaded TCP server, client
-  hl7v2/listener.py        message handler: HL7 → FHIR → DQI → predict → ACK
-  hl7v2/inbox.py           SQLite message store
-  hl7v2/send.py            CLI sender
-  quality.py               Data Quality Index
-  preprocess.py            flatten, score, clean, encode, split
-  train.py                 training + MLflow
-  inference.py             shared prediction (auto-reloads retrained models)
-  routing.py               clinician routing rules
-  app.py                   FastAPI (REST + FHIR + HL7 inbox; starts listener)
-interface/frontend.py      Streamlit dashboard
-samples/                   example FHIR Bundles (all versions) and HL7 messages
-  testdata/                Synthetic Test Data Creator: spec, generator, validation,
-                           audit, stats, fidelity, runner, CLI
-interface/testdata_tab.py  Test Data Creator tab
-tests/                     83 tests: quality, routing, FHIR, HL7, test data, end-to-end
+  cloud_data.py             00 package / upload / download + verify the dataset (GCS)
+  pipeline.py               train · serve · ui entry points; start-up download and training
+  request.py                01 the request (cohorts, targets, demographics, faults, split)
+  pools.py, selection.py    02 Synthea pools; eligibility, demographic quotas, fault injection
+  stdc/                     03 validation V01–V08 and repairs, independent audit, statistics
+  runner.py                 01–04 one request end to end; run storage and exports
+  mlpipe.py                 03 split 60/20/20, train and tune, evaluate, MLflow logging
+  inference.py              load a run's model and predict
+  app.py                    FastAPI service
+  fhir/, hl7v2/             FHIR multi-version builder/parser/validator; HL7 v2 + MLLP listener
+interface/
+  frontend.py, views/       Streamlit dashboard (one module per tab)
+  client.py                 HTTP client: the dashboard reads and writes everything through the API
+tools/data_quality_profile.py   the script users run on their own data (standard library only)
+tests/                      pytest suite and 12 Synthea fixture patients
+.github/workflows/ci.yml    tests on every push and pull request
 ```
+
+## Ethics, privacy and limitations
+
+- **Privacy:** no real patient data is used or stored. The profiling script runs on the user's system and returns aggregate counts only. Counts below 11 are suppressed, and fewer than 11 patients is refused. Every delivered record carries a synthetic identifier and the HL7 `HTEST` label, and records without the synthetic identifier are never modified.
+- **Representativeness:** Synthea simulates Massachusetts demographics and disease models. Quotas can match a requested race/ethnicity mix only where the pool has enough eligible patients, and the shortfall is reported per group. Synthetic patients don't reproduce the documentation gaps, coding habits or care inequities of a real EHR. That's why faults are injected explicitly.
+- **Bias check, not bias fix:** the demographics-only model is there to *detect* whether data quality depends on who the patient is. A high ROC AUC (as for cohort B here) means the delivered set under-represents some groups. Downstream tests could then miss failures that affect them.
+- **The model is deliberately simple** and isn't a clinical tool. Predictions describe synthetic data quality, never a real person.
+- **Operational limits:** runs live in the Cloud Run container, so they're lost when the instance is recycled (a new one re-downloads the data and retrains). The HL7 MLLP port is only reachable inside the container, which is why `POST /hl7/send` relays to it over HTTPS.
+
+## Collaboration
+
+Work happens on feature branches and is merged into `main` through pull requests. CI runs the tests on every PR.

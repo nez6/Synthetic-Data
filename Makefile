@@ -1,6 +1,6 @@
 PY ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
 IMAGE ?= stdc
-PROJECT ?= project-6b7609c4-221d-47e4-9fa
+PROJECT ?= stdc-13890
 REGION ?= us-east1
 SERVICE ?= stdc-api
 
@@ -51,5 +51,5 @@ docker-serve:   ## serving entry point in the container, on http://localhost:808
 
 deploy-api:     ## build with Cloud Build and deploy to Cloud Run (see README → Deploy)
 	gcloud run deploy $(SERVICE) --source . --project $(PROJECT) --region $(REGION) \
-	  --allow-unauthenticated --memory 4Gi --cpu 2 --no-cpu-throttling \
+	  --allow-unauthenticated --memory 8Gi --cpu 2 --no-cpu-throttling \
 	  --min-instances 0 --max-instances 1 --timeout 900

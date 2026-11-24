@@ -11,7 +11,7 @@ project:
 # fetches it; the Docker image does this on first start. DATA_BUCKET overrides the bucket.
 cloud:
   provider: "Google Cloud Storage"
-  bucket: "synthetic-test-data-6b7609c4"
+  bucket: "stdc-13890-data"
   prefix: "synthea-pools/v1"
   public_base_url: "https://storage.googleapis.com"
 
