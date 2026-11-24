@@ -1,4 +1,8 @@
-"""Flatten a FHIR Bundle (any supported version) back into a model-ready record."""
+"""Flatten a FHIR Bundle (any supported version) into one flat, model-ready record.
+
+Values are taken as recorded (the latest value per vital/lab), *including* implausible ones:
+the raw-data model is meant to see the data's problems. Missing elements come back as None.
+"""
 from datetime import date, datetime
 
 from src import terminology as t
@@ -16,7 +20,7 @@ def _omb_code(ext: dict):
     return None
 
 
-def _demographic_group(patient: dict):
+def race_ethnicity(patient: dict):
     race = ethnicity = None
     for ext in patient.get("extension", []):
         url = ext.get("url", "")
@@ -29,55 +33,83 @@ def _demographic_group(patient: dict):
     return t.RACE_BY_CODE.get(race)
 
 
-def age_on(birth_date: str, on: date):
+def age_on(birth_date, on: date):
     if not birth_date:
         return None
-    b = date.fromisoformat(birth_date[:10])
+    try:
+        b = date.fromisoformat(str(birth_date)[:10])
+    except ValueError:
+        return None
     return on.year - b.year - ((on.month, on.day) < (b.month, b.day))
 
 
-def _observation_value(observations: list[dict], loinc_code: str):
-    """Most recent value for a LOINC code (records can hold a series of results)."""
-    matches = []
-    for obs in observations:
-        codes = {c.get("code") for c in obs.get("code", {}).get("coding", []) if c.get("system") == t.LOINC}
-        if loinc_code in codes and obs.get("status") not in ("entered-in-error", "cancelled"):
-            matches.append((obs.get("effectiveDateTime") or "", obs))
-    if not matches:
-        return None, None
-    when, obs = max(matches, key=lambda m: m[0])
-    return obs.get("valueQuantity", {}).get("value"), when or None
+def _loincs(cc):
+    return {c.get("code") for c in (cc or {}).get("coding", []) if c.get("system") == t.LOINC}
 
 
-def bundle_to_record(bundle: dict) -> dict:
-    """Return a flat record. Missing elements come back as None (the DQI layer scores them)."""
+def _language(patient):
+    for comm in patient.get("communication", []):
+        for c in comm.get("language", {}).get("coding", []):
+            code = (c.get("code") or "").lower()
+            if code in ("en", "en-us"):
+                return "en-US"
+            if code in t.LANGUAGES:
+                return code
+            if code:
+                return "other"
+    return None
+
+
+def bundle_to_record(bundle: dict, as_of: date | None = None) -> dict:
     patients = _resources(bundle, "Patient")
     patient = patients[0] if patients else {}
-    observations = _resources(bundle, "Observation")
 
-    hba1c, effective = _observation_value(observations, t.HBA1C["code"])
-    bmi, bmi_effective = _observation_value(observations, t.BMI["code"])
-    effective = effective or bmi_effective
-    as_of = datetime.fromisoformat(effective.replace("Z", "+00:00")).date() if effective else date.today()
+    latest = {}       # lab key -> (when, value)
+    smoking = (None, None)
+    for obs in _resources(bundle, "Observation"):
+        if obs.get("status") in ("entered-in-error", "cancelled"):
+            continue
+        when = obs.get("effectiveDateTime") or ""
+        codes = _loincs(obs.get("code"))
+        if t.SMOKING_LOINC[0] in codes:
+            code = next((c.get("code") for c in obs.get("valueCodeableConcept", {}).get("coding", [])), None)
+            if when >= (smoking[0] or ""):
+                smoking = (when, t.SMOKING_BY_CODE.get(code))
+        parts = [(codes, obs.get("valueQuantity"))] + [(_loincs(c.get("code")), c.get("valueQuantity"))
+                                                       for c in obs.get("component", [])]
+        for part_codes, q in parts:
+            for code in part_codes:
+                key = t.LAB_BY_CODE.get(code)
+                if key and q and isinstance(q.get("value"), (int, float)) and when >= latest.get(key, ("",))[0]:
+                    latest[key] = (when, q["value"])
+
+    conditions = set()
+    for cond in _resources(bundle, "Condition"):
+        for c in cond.get("code", {}).get("coding", []):
+            if c.get("code") in t.CONDITION_BY_CODE:
+                conditions.add(t.CONDITION_BY_CODE[c["code"]])
+
+    effective = max((w for w, _ in latest.values()), default=None) or None
+    if as_of is None:
+        as_of = datetime.fromisoformat(effective.replace("Z", "+00:00")).date() if effective else date.today()
+    address = (patient.get("address") or [{}])[0]
 
     record = {
         "patient_id": patient.get("id"),
         "gender": patient.get("gender"),
         "birth_date": patient.get("birthDate"),
         "effective": effective,
-        "race_demographic": _demographic_group(patient),
         "age": age_on(patient.get("birthDate"), as_of),
-        "bmi": bmi,
-        "baseline_hba1c": hba1c,
-        "recommended_medication_plan": None,
-        "recommended_meal_plan": None,
+        "sex": patient.get("gender"),
+        "race_ethnicity": race_ethnicity(patient),
+        "language": _language(patient),
+        "state": address.get("state"),
+        "smoking": smoking[1],
+        **{k: latest[k][1] if k in latest else None for k in t.LABS},
+        "conditions": sorted(conditions),
+        "n_encounters": len(_resources(bundle, "Encounter")),
     }
-    for cp in _resources(bundle, "CarePlan"):
-        kinds = {c.get("text") for c in cp.get("category", [])}
-        if "medication-plan" in kinds:
-            record["recommended_medication_plan"] = cp.get("description")
-        if "meal-plan" in kinds:
-            record["recommended_meal_plan"] = cp.get("description")
+    record["complex_care"] = t.complex_care(conditions)
     return record
 
 
@@ -102,5 +134,9 @@ def detect_version(bundle: dict) -> tuple[str, list[str]]:
         if "context" in obs or "comment" in obs:
             evidence.append("Observation.context / Observation.comment → STU3")
             return "STU3", evidence
+    for cond in _resources(bundle, "Condition"):
+        if isinstance(cond.get("clinicalStatus"), str):
+            evidence.append("Condition.clinicalStatus is a plain code → DSTU2/STU3")
+            return ("DSTU2" if "patient" in cond else "STU3"), evidence
     evidence.append("No pre-R4 or R5 fingerprints found; R4 and R4B are identical for these resources")
     return "R4/R4B", evidence

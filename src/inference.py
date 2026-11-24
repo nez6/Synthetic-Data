@@ -1,71 +1,46 @@
-"""Shared prediction logic used by the REST API, the FHIR endpoint and the HL7 listener."""
-import json
+"""Serve the ML model: does a patient with these demographics pass validation?
+
+Loads model_validated.pkl (or model_raw.pkl) from a run folder; defaults to the latest run.
+"""
 import pickle
 
-import pandas as pd
-
-from src.config import load_config, resolve
-from src.preprocess import FEATURES
-from src.quality import ISSUE_LABELS, score_record
-from src.routing import recommend_provider
+from src import mlpipe, runner
 
 
 class ModelNotReady(RuntimeError):
     pass
 
 
-_cache = {"key": None, "artifacts": None}
+_cache = {}
 
 
-def load_artifacts():
-    """Load models, reloading automatically whenever they are retrained."""
-    a = load_config()["artifacts"]
-    paths = [resolve(a[k]) for k in ("med_model_path", "meal_model_path", "encoder_path", "quality_report_path")]
-    missing = [p.name for p in paths if not p.exists()]
-    if missing:
-        raise ModelNotReady(f"Model not trained yet (missing {', '.join(missing)}). Train it first.")
-    key = tuple(p.stat().st_mtime for p in paths)
-    if _cache["key"] != key:
-        loaded = []
-        for p in paths[:3]:
-            with open(p, "rb") as f:
-                loaded.append(pickle.load(f))
-        loaded.append(json.loads(paths[3].read_text()))
-        _cache.update(key=key, artifacts=tuple(loaded))
-    return _cache["artifacts"]
+def _model_path(run_id: str | None, which: str):
+    runs = runner.list_runs()
+    if not runs:
+        raise ModelNotReady("No run yet: submit a test-data request first (it trains the model).")
+    run_id = run_id or runs[0]["run_id"]
+    path = runner.runs_dir() / run_id / "ml" / f"model_{which}.pkl"
+    if not path.exists():
+        raise ModelNotReady(f"Run {run_id} has no {which} model.")
+    return run_id, path
 
 
-def predict(record: dict) -> dict:
-    config = load_config()
-    med_model, meal_model, encoders, quality_report = load_artifacts()
+def load_model(run_id: str | None = None, which: str = "validated"):
+    run_id, path = _model_path(run_id, which)
+    key = (str(path), path.stat().st_mtime)
+    if key not in _cache:
+        with open(path, "rb") as f:
+            _cache[key] = pickle.load(f)
+    return run_id, _cache[key]
 
-    race, bmi, hba1c, age = (record.get(k) for k in ("race_demographic", "bmi", "baseline_hba1c", "age"))
-    quality = score_record(race, bmi, hba1c, age)
 
-    unknown = config["data"]["unknown_race_label"]
-    race_value = race if race in encoders["race_demographic"].classes_ else unknown
-    bmi_value = bmi if bmi is not None else quality_report["bmi_median"]
-    hba1c_value = hba1c if hba1c is not None else 0.0
-    age_value = age if age is not None else 50
-
-    features = pd.DataFrame([{
-        "race_demographic": encoders["race_demographic"].transform([race_value])[0],
-        "age": age_value,
-        "bmi": bmi_value,
-        "baseline_hba1c": hba1c_value,
-    }])[FEATURES]
-
-    med = encoders[config["data"]["target_medication"]].inverse_transform(med_model.predict(features))[0]
-    meal = encoders[config["data"]["target_meal"]].inverse_transform(meal_model.predict(features))[0]
-
-    return {
-        "data_quality_index": quality["score"],
-        "data_quality_issues": quality["issues"],
-        "data_quality_issue_labels": [ISSUE_LABELS[i] for i in quality["issues"]],
-        "low_quality_warning": quality["score"] < config["min_quality_threshold"],
-        "features_used": {"race_demographic": race_value, "age": age_value, "bmi": bmi_value,
-                          "baseline_hba1c": hba1c_value},
-        "predicted_medication_strategy": med,
-        "predicted_dietary_strategy": meal,
-        "recommended_provider_routing": recommend_provider(hba1c_value, bmi_value, med),
-    }
+def predict_pass(rows: list[dict], run_id: str | None = None, which: str = "validated") -> dict:
+    """rows: [{age, sex, race_ethnicity, cohort}] → probability each record passes validation."""
+    run_id, model = load_model(run_id, which)
+    clean = [{"age": r.get("age"), "sex": r.get("sex") or "unknown",
+              "race_ethnicity": r.get("race_ethnicity") or "Not recorded", "cohort": r.get("cohort") or "A"}
+             for r in rows]
+    probs = mlpipe.predict(model, clean)
+    return {"run_id": run_id, "model": which,
+            "predictions": [{"input": c, "probability_pass": round(p, 4), "predicted_pass": p >= 0.5}
+                            for c, p in zip(clean, probs)]}

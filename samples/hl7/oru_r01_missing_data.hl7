@@ -1,4 +1,0 @@
-MSH|^~\&|LAB_SYS|CLINIC|DQI_ROUTER|DIABETES_PROJECT|20261122034220||ORU^R01^ORU_R01|SAMPLE0002|P|2.5.1
-PID|1||pt-sample^^^CLINIC^MR||Synthetic^Patient pt-sample||19740502|F||||||||||||||
-OBR|1|||4548-4^Hemoglobin A1c/Hemoglobin.total in Blood^LN|||20260304103000
-OBX|1|NM|4548-4^Hemoglobin A1c/Hemoglobin.total in Blood^LN||99|%^percent^UCUM|4.0-5.6|H|||F|||20260304103000

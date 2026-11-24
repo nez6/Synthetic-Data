@@ -1,70 +1,42 @@
-"""Data Quality Index (DQI): deterministic 0-100 completeness/validity score per record.
+"""Record-level Data Quality Index (0-100) for a single flat record.
 
-Applied to records *after* they are extracted from FHIR (or HL7 v2), so a missing value
-means the corresponding FHIR element / HL7 field was absent. Shared by the training
-pipeline, the REST API and the HL7 listener so every path uses identical rules.
+Used where one record arrives on its own (REST /predict, FHIR $predict, the HL7 listener).
+Whole test patients are scored by the validation script (src/stdc/validation.py) instead.
 """
 import math
 
+from src import terminology as t
 from src.config import load_config
 
-ISSUE_LABELS = {
-    "missing_race": "Race/ethnicity not recorded",
-    "missing_bmi": "BMI observation missing",
-    "out_of_bounds_bmi": "BMI implausible",
-    "missing_age": "Birth date missing",
-    "out_of_bounds_hba1c": "HbA1c missing or implausible",
-}
+ISSUE_LABELS = {"missing_race_ethnicity": "Race/ethnicity not recorded", "missing_birthdate": "Birth date missing",
+                "missing_sex": "Sex not recorded",
+                **{f"missing_{k}": f"{k.replace('_', ' ')} missing" for k in t.LABS},
+                **{f"implausible_{k}": f"{k.replace('_', ' ')} implausible" for k in t.LABS}}
 
 
-def _is_missing(value) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    if isinstance(value, str) and not value.strip():
-        return True
-    return False
+def _missing(v) -> bool:
+    return v is None or (isinstance(v, float) and math.isnan(v)) or (isinstance(v, str) and not v.strip())
 
 
-def score_record(race, bmi, hba1c, age) -> dict:
-    """Return {"score": int, "issues": [str]} for one record."""
-    config = load_config()
-    w = config["quality_weights"]
-    b = config["quality_bounds"]
-
-    score = 100
-    issues = []
-
-    if _is_missing(race):
-        score -= w["missing_race_penalty"]
-        issues.append("missing_race")
-
-    if _is_missing(bmi):
-        score -= w["missing_bmi_penalty"]
-        issues.append("missing_bmi")
-    elif not (b["bmi_min"] <= bmi <= b["bmi_max"]):
-        score -= w["out_of_bounds_bmi_penalty"]
-        issues.append("out_of_bounds_bmi")
-
-    if _is_missing(age):
-        score -= w["missing_age_penalty"]
-        issues.append("missing_age")
-
-    if _is_missing(hba1c) or not (b["hba1c_min"] <= hba1c <= b["hba1c_max"]):
-        score -= w["out_of_bounds_hba1c_penalty"]
-        issues.append("out_of_bounds_hba1c")
-
-    return {"score": max(score, 0), "issues": issues}
-
-
-def score_dataframe(df):
-    """Add `data_quality_index` and `data_quality_issues` columns (returns a copy)."""
-    out = df.copy()
-    results = [
-        score_record(r, b, h, a)
-        for r, b, h, a in zip(out["race_demographic"], out["bmi"], out["baseline_hba1c"], out["age"])
-    ]
-    out["data_quality_index"] = [r["score"] for r in results]
-    out["data_quality_issues"] = [", ".join(r["issues"]) for r in results]
-    return out
+def score_record(rec: dict) -> dict:
+    cfg = load_config()
+    w, bounds = cfg["quality_weights"], cfg["quality_bounds"]
+    score, issues = 100, []
+    if _missing(rec.get("race_ethnicity")):
+        score -= w["missing_race_ethnicity"]
+        issues.append("missing_race_ethnicity")
+    if _missing(rec.get("birth_date")) and _missing(rec.get("age")):
+        score -= w["missing_birthdate"]
+        issues.append("missing_birthdate")
+    if _missing(rec.get("sex") or rec.get("gender")):
+        score -= w["missing_sex"]
+        issues.append("missing_sex")
+    for key in t.LABS:
+        v = rec.get(key)
+        if _missing(v):
+            score -= w["missing_lab"]
+            issues.append(f"missing_{key}")
+        elif not bounds[key][0] <= v <= bounds[key][1]:
+            score -= w["implausible_lab"]
+            issues.append(f"implausible_{key}")
+    return {"score": max(score, 0), "issues": issues, "labels": [ISSUE_LABELS[i] for i in issues]}

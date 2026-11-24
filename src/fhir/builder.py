@@ -1,14 +1,13 @@
-"""Turn a flat patient record into a FHIR Bundle for a chosen FHIR version.
+"""Turn a flat patient record into a one-visit FHIR Bundle for a chosen FHIR version.
 
-Record keys:
-    patient_id, gender, birth_date (YYYY-MM-DD), effective (ISO datetime),
-    race_demographic (str | None), bmi (float | None), baseline_hba1c (float | None),
-    recommended_medication_plan / recommended_meal_plan (optional labels)
+Used for the FHIR-version comparison, `$convert`, HL7 → FHIR, and exporting a dataset in a
+version other than R4 (the full multi-visit test records are R4; see src/testdata/generator.py).
 
-Fields that are missing in the record are *omitted* from the FHIR output (no race
-extension, no BMI Observation), the same way a real source system would send them.
+Record keys (as produced by src/fhir/parser.py): patient_id, gender, birth_date, effective,
+race_ethnicity, language, state, smoking, bmi, systolic_bp, hba1c, egfr, conditions.
+Missing values are *omitted* from the output, the way a real source system would send them.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src import terminology as t
 from src.fhir.versions import VERSIONS
@@ -17,9 +16,11 @@ BASE_URL = "https://example.org/fhir"
 
 _OBS_CATEGORY_OLD = "http://hl7.org/fhir/observation-category"
 _OBS_CATEGORY_NEW = "http://terminology.hl7.org/CodeSystem/observation-category"
+_COND_CATEGORY_OLD = "http://hl7.org/fhir/condition-category"
+_COND_CATEGORY_NEW = "http://terminology.hl7.org/CodeSystem/condition-category"
 _ACTCODE_OLD = "http://hl7.org/fhir/v3/ActCode"
 _ACTCODE_NEW = "http://terminology.hl7.org/CodeSystem/v3-ActCode"
-_CATEGORY_DISPLAY = {"laboratory": "Laboratory", "vital-signs": "Vital Signs"}
+_CATEGORY_DISPLAY = {"laboratory": "Laboratory", "vital-signs": "Vital Signs", "social-history": "Social History"}
 
 
 def _missing(v) -> bool:
@@ -37,8 +38,8 @@ def _omb_extension(url: str, code: str, display: str) -> dict:
     }
 
 
-def _demographic_extensions(group, version: str) -> list[dict]:
-    if _missing(group):
+def demographic_extensions(group, version: str = "R4") -> list[dict]:
+    if _missing(group) or (group != t.HISPANIC_GROUP and group not in t.RACE_CODES):
         return []
     if version == "DSTU2":
         race_url = "http://fhir.org/guides/argonaut/StructureDefinition/argo-race"
@@ -46,30 +47,38 @@ def _demographic_extensions(group, version: str) -> list[dict]:
     else:
         race_url = "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race"
         eth_url = "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity"
-
     if group == t.HISPANIC_GROUP:
         return [_omb_extension(eth_url, *t.HISPANIC)]
     code, display = t.RACE_CODES[group]
     return [_omb_extension(race_url, code, display), _omb_extension(eth_url, *t.NOT_HISPANIC)]
 
 
+def language_element(code) -> dict | None:
+    if _missing(code):
+        return None
+    display = t.LANGUAGES.get(code, "Other")
+    real_code = "fr" if code == "other" else code
+    return {"language": {"coding": [{"system": t.BCP47, "code": real_code, "display": display}], "text": display}}
+
+
 def _patient(rec: dict, version: str) -> dict:
     profile = ("http://fhir.org/guides/argonaut/StructureDefinition/argo-patient" if version == "DSTU2"
                else "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient")
-    patient = {
-        "resourceType": "Patient",
-        "id": rec["patient_id"],
-        "meta": {"profile": [profile]},
-    }
-    ext = _demographic_extensions(rec.get("race_demographic"), version)
+    patient = {"resourceType": "Patient", "id": rec["patient_id"], "meta": {"profile": [profile]}}
+    ext = demographic_extensions(rec.get("race_ethnicity"), version)
     if ext:
         patient["extension"] = ext
     patient["identifier"] = [{"system": "https://example.org/mrn", "value": rec["patient_id"]}]
     patient["name"] = [{"family": "Synthetic", "given": [f"Patient {rec['patient_id']}"]}]
-    if rec.get("gender"):
+    if not _missing(rec.get("gender")):
         patient["gender"] = rec["gender"]
     if not _missing(rec.get("birth_date")):
         patient["birthDate"] = rec["birth_date"]
+    if not _missing(rec.get("state")):
+        patient["address"] = [{"state": rec["state"], "country": "US"}]
+    lang = language_element(rec.get("language"))
+    if lang:
+        patient["communication"] = [lang]
     return patient
 
 
@@ -78,7 +87,6 @@ def _encounter(rec: dict, version: str) -> dict:
     end = (datetime.fromisoformat(start) + timedelta(minutes=30)).isoformat()
     enc = {"resourceType": "Encounter", "id": f"{rec['patient_id']}-enc"}
     patient_ref = {"reference": f"Patient/{rec['patient_id']}"}
-
     if version == "DSTU2":
         enc.update(status="finished", **{"class": "ambulatory"}, patient=patient_ref,
                    period={"start": start, "end": end})
@@ -97,23 +105,18 @@ def _encounter(rec: dict, version: str) -> dict:
     return enc
 
 
-def _observation(rec: dict, version: str, spec: dict, value: float, suffix: str, note: str = None) -> dict:
+def _observation(rec, version, oid, category, code, display, value: dict, note=None) -> dict:
     cat_system = _OBS_CATEGORY_OLD if version in ("DSTU2", "STU3") else _OBS_CATEGORY_NEW
-    category = {"coding": [{"system": cat_system, "code": spec["category"],
-                            "display": _CATEGORY_DISPLAY[spec["category"]]}]}
+    cat = {"coding": [{"system": cat_system, "code": category, "display": _CATEGORY_DISPLAY[category]}]}
     obs = {
-        "resourceType": "Observation",
-        "id": f"{rec['patient_id']}-{suffix}",
-        "status": "final",
-        "category": category if version == "DSTU2" else [category],
-        "code": {"coding": [{"system": t.LOINC, "code": spec["code"], "display": spec["display"]}],
-                 "text": spec["display"]},
+        "resourceType": "Observation", "id": oid, "status": "final",
+        "category": cat if version == "DSTU2" else [cat],
+        "code": {"coding": [{"system": t.LOINC, "code": code, "display": display}], "text": display},
         "subject": {"reference": f"Patient/{rec['patient_id']}"},
     }
-    enc_ref = {"reference": f"Encounter/{rec['patient_id']}-enc"}
-    obs["context" if version == "STU3" else "encounter"] = enc_ref
+    obs["context" if version == "STU3" else "encounter"] = {"reference": f"Encounter/{rec['patient_id']}-enc"}
     obs["effectiveDateTime"] = rec["effective"]
-    obs["valueQuantity"] = {"value": value, "unit": spec["unit"], "system": t.UCUM, "code": spec["unit"]}
+    obs.update(value)
     if note:
         if version == "DSTU2":
             obs["comments"] = note
@@ -124,35 +127,59 @@ def _observation(rec: dict, version: str, spec: dict, value: float, suffix: str,
     return obs
 
 
-def _careplan(rec: dict, version: str, kind: str, description: str) -> dict:
-    cp = {"resourceType": "CarePlan", "id": f"{rec['patient_id']}-cp-{kind}", "status": "active"}
-    if version != "DSTU2":
-        cp["intent"] = "plan"
-    cp["category"] = [{"text": f"{kind}-plan"}]
-    cp["description"] = description
-    cp["subject"] = {"reference": f"Patient/{rec['patient_id']}"}
-    return cp
+def _condition(rec, version, key) -> dict:
+    c = t.CONDITIONS[key]
+    cond = {"resourceType": "Condition", "id": f"{rec['patient_id']}-{key}"}
+    code = {"coding": [{"system": t.SNOMED, "code": c["snomed"][0], "display": c["snomed"][1]},
+                       {"system": t.ICD10, "code": c["icd10"][0], "display": c["icd10"][1]}], "text": c["label"]}
+    ref = {"reference": f"Patient/{rec['patient_id']}"}
+    if version == "DSTU2":
+        cond.update(patient=ref, code=code, clinicalStatus="active", verificationStatus="confirmed",
+                    category={"coding": [{"system": _COND_CATEGORY_OLD, "code": "diagnosis"}]})
+    elif version == "STU3":
+        cond.update(clinicalStatus="active", verificationStatus="confirmed",
+                    category=[{"coding": [{"system": _COND_CATEGORY_OLD, "code": "problem-list-item"}]}],
+                    code=code, subject=ref)
+    else:
+        cond.update(
+            clinicalStatus={"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                                        "code": "active"}]},
+            verificationStatus={"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                                            "code": "confirmed"}]},
+            category=[{"coding": [{"system": _COND_CATEGORY_NEW, "code": "problem-list-item"}]}],
+            code=code, subject=ref)
+    return cond
 
 
 def build_bundle(rec: dict, version: str = "R4") -> dict:
     if version not in VERSIONS:
         raise ValueError(f"Unsupported FHIR version {version!r}; choose one of {list(VERSIONS)}")
+    rec = dict(rec)
+    rec["effective"] = rec.get("effective") or datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     resources = [_patient(rec, version), _encounter(rec, version)]
-    if not _missing(rec.get("baseline_hba1c")):
-        resources.append(_observation(rec, version, t.HBA1C, float(rec["baseline_hba1c"]), "hba1c",
-                                      note="Synthetic record generated for demonstration."))
-    if not _missing(rec.get("bmi")):
-        resources.append(_observation(rec, version, t.BMI, float(rec["bmi"]), "bmi"))
-    if not _missing(rec.get("recommended_medication_plan")):
-        resources.append(_careplan(rec, version, "medication", rec["recommended_medication_plan"]))
-    if not _missing(rec.get("recommended_meal_plan")):
-        resources.append(_careplan(rec, version, "meal", rec["recommended_meal_plan"]))
+    first = True
+    for key, lab in t.LABS.items():
+        if _missing(rec.get(key)):
+            continue
+        value = {"valueQuantity": {"value": float(rec[key]), "unit": lab["unit"], "system": t.UCUM,
+                                   "code": lab["unit"]}}
+        resources.append(_observation(rec, version, f"{rec['patient_id']}-{key.replace('_', '-')}",
+                                      lab["category"], lab["code"],
+                                      lab["display"], value,
+                                      note="Synthetic record generated for testing." if first else None))
+        first = False
+    if not _missing(rec.get("smoking")) and rec["smoking"] in t.SMOKING:
+        code, display = t.SMOKING[rec["smoking"]]
+        resources.append(_observation(
+            rec, version, f"{rec['patient_id']}-smoking", "social-history", *t.SMOKING_LOINC,
+            {"valueCodeableConcept": {"coding": [{"system": t.SNOMED, "code": code, "display": display}]}}))
+    for key in rec.get("conditions") or []:
+        if key in t.CONDITIONS:
+            resources.append(_condition(rec, version, key))
 
     bundle = {"resourceType": "Bundle", "id": f"{rec['patient_id']}-bundle", "type": "collection"}
     if version in ("R4", "R4B", "R5"):
-        bundle["timestamp"] = rec["effective"]  # FHIR requires a timezone; generator always includes one
-    bundle["entry"] = [
-        {"fullUrl": f"{BASE_URL}/{r['resourceType']}/{r['id']}", "resource": r} for r in resources
-    ]
+        bundle["timestamp"] = rec["effective"]  # FHIR requires a timezone; inputs always carry one
+    bundle["entry"] = [{"fullUrl": f"{BASE_URL}/{r['resourceType']}/{r['id']}", "resource": r} for r in resources]
     return bundle
