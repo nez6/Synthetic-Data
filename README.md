@@ -204,7 +204,7 @@ Checked on 24 Nov 2026:
 | Check | Result |
 |---|---|
 | Tests (`make test`) | 63 passed |
-| `docker build` from a fresh clone of `main` (Google Cloud Shell, Docker 27) | Built in 161 s; `docker run … serve` started, downloaded the pools from GCS and served `/health` |
+| `docker build` from a fresh clone of `main` (Google Cloud Shell) | Built in 161 s; `docker run … serve` started, downloaded the pools from GCS and served `/health` |
 | Cloud Run (same Dockerfile, built by Cloud Build) | Start-up downloads the data and trains in ~6 min; `/health` reports `ready` |
 | Live `/predict` | `{"age":72,"sex":"female","race_ethnicity":"Hispanic/Latino","cohort":"B"}` → `{"model":"validated","probability_pass":0.0411,"predicted_pass":false}`. Same value as a local run, so the pipeline is reproducible |
 | Live front end | Sidebar shows the API as reachable; the ML tab's Predict calls the deployed `/predict` |
