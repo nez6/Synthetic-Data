@@ -2,10 +2,10 @@
 import json
 
 import pandas as pd
-import requests
 import streamlit as st
 
-from interface.common import api_url, explain, pick_run
+from interface import client
+from interface.common import ApiError, api_url, explain, pick_run
 
 
 def render():
@@ -36,19 +36,18 @@ curl '{base}/runs/{run_id}/patients/<patient_id>?fhir_version=R5'      # one pat
     c1, c2, c3 = st.columns(3)
     if c1.button("GET /runs"):
         try:
-            st.dataframe(pd.DataFrame(requests.get(f"{base}/runs", timeout=10).json()), hide_index=True)
-        except requests.RequestException as e:
-            st.error(f"API not reachable: {e}")
+            st.dataframe(pd.DataFrame(client.get("/runs")), hide_index=True)
+        except ApiError as e:
+            st.error(str(e))
     if c2.button(f"GET /runs/{run_id[:15]}…/dataset?format=csv"):
         try:
-            res = requests.get(f"{base}/runs/{run_id}/dataset", params={"format": "csv"}, timeout=60)
-            st.caption(f"HTTP {res.status_code} · {len(res.content):,} bytes")
-            st.code("\n".join(res.text.splitlines()[:6]), language="text")
-        except requests.RequestException as e:
-            st.error(f"API not reachable: {e}")
+            body = client.get_bytes(f"/runs/{run_id}/dataset", format="csv")
+            st.caption(f"HTTP 200 · {len(body):,} bytes")
+            st.code("\n".join(body.decode().splitlines()[:6]), language="text")
+        except ApiError as e:
+            st.error(str(e))
     if c3.button("GET /requests/default"):
         try:
-            st.code(json.dumps(requests.get(f"{base}/requests/default", timeout=10).json(), indent=1)[:3000],
-                    language="json")
-        except requests.RequestException as e:
-            st.error(f"API not reachable: {e}")
+            st.code(json.dumps(client.get("/requests/default"), indent=1)[:3000], language="json")
+        except ApiError as e:
+            st.error(str(e))

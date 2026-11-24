@@ -4,10 +4,10 @@ import json
 import pandas as pd
 import streamlit as st
 
-from interface.common import explain
-from src import pools
+from interface import client
+from interface.common import ApiError, explain
 from src.config import load_config, resolve
-from tools.data_quality_profile import QUALITY_KEYS, profile_paths
+from tools.data_quality_profile import QUALITY_KEYS
 
 QUALITY_LABELS = {
     "missing_birthdate": "Birth date missing", "missing_race_ethnicity": "Race/ethnicity not recorded",
@@ -85,14 +85,13 @@ def render():
     with st.expander("No data handy? Profile the Synthea pools as a demo"):
         st.caption("Runs the same script on this app's own Synthea pools, as if they were your data. Useful to see "
                    "what a profile looks like; a request matched to it reproduces Synthea's own mix.")
-        names = [p["pool"] for p in pools.list_pools()]
-        if st.button("Profile the pools", disabled=not names):
-            with st.spinner("Profiling…"):
-                prof = profile_paths([str(pools.pools_dir() / n / "patients") for n in names],
-                                     k_min=load_config()["privacy"]["k_min_cell_size"],
-                                     source="Demo: Synthea pools " + "+".join(names))
-            st.session_state["profile"] = prof
-            st.success("Demo profile loaded.")
+        if st.button("Profile the pools"):
+            try:
+                with st.spinner("Profiling on the API (GET /pools/profile)…"):
+                    st.session_state["profile"] = client.get("/pools/profile", timeout=300)
+                st.success("Demo profile loaded.")
+            except ApiError as e:
+                st.error(str(e))
 
     if "profile" in st.session_state:
         st.markdown("#### Current profile")

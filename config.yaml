@@ -7,6 +7,14 @@ project:
   mlflow_experiment: "synthetic_test_data_ml"
   random_state: 42
 
+# Step 00 · where the dataset (the Synthea pools) is hosted. `python -m src.cloud_data download`
+# fetches it; the Docker image does this on first start. DATA_BUCKET overrides the bucket.
+cloud:
+  provider: "Google Cloud Storage"
+  bucket: "synthetic-test-data-6b7609c4"
+  prefix: "synthea-pools/v1"
+  public_base_url: "https://storage.googleapis.com"
+
 paths:
   runs_dir: "data/runs"                # one folder per dataset run
   hl7_inbox_db: "data/hl7_inbox.db"

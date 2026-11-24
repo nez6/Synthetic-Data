@@ -1,17 +1,14 @@
 """📝 Request · "Test Patient Data: N Records Requested" (cohorts, resource targets, data depth)."""
 import copy
-import subprocess
-import sys
+import time
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 
-from interface.common import explain
-from src import pools, runner
-from src.config import ROOT, load_config
+from interface import client
+from interface.common import ApiError, api_url, explain
 from src.request import FAULTS, RESOURCE_ROWS, STRESS_FACTOR, apply_profile, default_request, problems
-from src.selection import eligible
 
 GROUP_LABELS = {"chf": "CHF", "ckd_esrd": "CKD/ESRD", "t2d": "T2D", "copd": "COPD"}
 
@@ -41,29 +38,36 @@ def _apply_targets(cohorts, df):
 
 def _pools_panel(request):
     st.markdown("##### Synthea pools (step 02)")
-    rows = pools.list_pools()
-    by_name = {p["pool"]: p for p in rows}
-    table = []
-    for c in request["cohorts"]:
-        idx = pools.load_index(c["pool"])
-        table.append({"cohort": c["name"], "pool": c["pool"],
-                      "people simulated": by_name.get(c["pool"], {}).get("people", 0),
-                      "eligible for cohort": sum(eligible(r, c) for r in idx),
-                      "ages": by_name.get(c["pool"], {}).get("ages", "–"),
-                      "history (yrs)": by_name.get(c["pool"], {}).get("years_of_history", "–")})
+    try:
+        by_name = {p["pool"]: p for p in client.get("/pools")}
+        elig = {e["cohort"]: e["eligible"] for e in client.post("/pools/eligible", request)}
+    except ApiError as e:
+        st.error(str(e))
+        return
+    table = [{"cohort": c["name"], "pool": c["pool"],
+              "people simulated": by_name.get(c["pool"], {}).get("people", 0),
+              "eligible for cohort": elig.get(c["name"], 0),
+              "ages": by_name.get(c["pool"], {}).get("ages", "–"),
+              "history (yrs)": by_name.get(c["pool"], {}).get("years_of_history", "–")} for c in request["cohorts"]]
     st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch")
-    with st.expander("Grow a pool (runs Synthea in the background)"):
-        cfg = load_config()["synthea"]["pools"]
-        c1, c2, c3 = st.columns([1, 1, 1])
-        name = c1.selectbox("Pool", list(cfg))
-        n = c2.number_input("People to add", 50, 5000, 500, step=50)
-        c3.write("")
-        if c3.button("▶ Run Synthea"):
-            seed = cfg[name]["seed"] + 1000 * (len(pools.load_info(name)["chunks"]) if pools.load_info(name) else 0)
-            subprocess.Popen([sys.executable, "-m", "src.pools", "build", name, "--population", str(int(n)),
-                              "--seed", str(seed)], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            st.success(f"Synthea started for pool {name}. Expect ~2 s per person; press 🔄 Refresh to follow.")
-        st.caption("Pool B needs many people: only ~7–10% of 50–90-year-olds have 2+ chronic condition groups.")
+    st.caption("Pools are pre-built with Synthea and downloaded from Google Cloud Storage. To grow one, run "
+               "`python -m src.pools build B --population 800` locally (needs Java), then "
+               "`python -m src.cloud_data upload`.")
+
+
+def _submit(req: dict, profile: dict | None):
+    """POST /runs, then poll /jobs/{id} until the run is finished."""
+    job = client.post("/runs", {"request": req, "real_profile": profile})
+    bar = st.progress(0.0, "Queued…")
+    while job["status"] == "running":
+        time.sleep(1.5)
+        job = client.get(f"/jobs/{job['job_id']}")
+        bar.progress(min(float(job.get("progress") or 0), 1.0), job.get("message") or "")
+    bar.empty()
+    if job["status"] != "done":
+        raise ApiError(job.get("error") or "run failed")
+    client.runs.clear()
+    return client.get(f"/runs/{job['run_id']}")
 
 
 def render():
@@ -153,16 +157,13 @@ def render():
     for p in issues:
         st.error(p)
     if st.button("🧬 Generate & validate", type="primary", disabled=bool(issues)):
-        bar = st.progress(0.0, "Starting…")
         try:
-            report = runner.run(req, real_profile=st.session_state.get("profile"),
-                                progress=lambda f, m: bar.progress(min(f, 1.0), m))
-        except (RuntimeError, ValueError) as e:
+            report = _submit(req, st.session_state.get("profile"))
+        except ApiError as e:
             st.error(str(e))
             return
-        bar.empty()
         st.session_state["run_id"] = report["run_id"]
         o = report["cohort_scores"]["Overall"]
         st.success(f"Run **{report['run_id']}**: {report['n_tested']} patients tested, pass rate "
                    f"{o['baseline_pass_rate']:.1%} → {o['validated_pass_rate']:.1%}, {report['n_delivered']} "
-                   "delivered. Open **✅ Results** and **🧠 ML**.")
+                   f"delivered. Open **✅ Results** and **🧠 ML**. (POST {api_url()}/runs)")

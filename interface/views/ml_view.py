@@ -1,10 +1,9 @@
 """🧠 ML · "Each cohort is split 60/20/20 to train the model" + raw vs validated + synthetic vs real."""
 import pandas as pd
-import requests
 import streamlit as st
 
-from interface.common import api_url, explain, grouped_hbar, load_run, pct, pick_run
-from src import runner
+from interface import client
+from interface.common import ApiError, api_url, explain, grouped_hbar, load_run, pct, pick_run
 from src.request import NOT_RECORDED
 
 MODEL_NAMES = {"raw": "Raw data (before validation)", "validated": "Validated data (after validation)"}
@@ -134,15 +133,11 @@ def _predict():
     which = c5.selectbox("Model", ["validated", "raw"])
     if st.button("Predict"):
         try:
-            res = requests.post(f"{api_url()}/predict", json={"age": age, "sex": sex, "race_ethnicity": race,
-                                                              "cohort": cohort, "model": which}, timeout=10)
-        except requests.RequestException as e:
-            st.error(f"API not reachable at {api_url()}: {e}")
+            body = client.post("/predict", {"age": age, "sex": sex, "race_ethnicity": race,
+                                            "cohort": cohort, "model": which})
+        except ApiError as e:
+            st.error(str(e))
             return
-        if res.status_code != 200:
-            st.error(f"{res.status_code}: {res.json().get('detail')}")
-            return
-        body = res.json()
         st.metric("Probability this record passes validation", pct(body["probability_pass"]),
                   "predicted to pass" if body["predicted_pass"] else "predicted to fail", delta_color="off")
         st.caption(f"Run {body['run_id']} · {body['model']} model · POST {api_url()}/predict")
@@ -159,8 +154,11 @@ def render():
     _split_boxes(ml, rep)
     _final(ml)
     _models(ml)
-    st.image(str(runner.runs_dir() / run_id / "ml" / "pass_rates.png"),
-             caption="Pass rate before and after validation, per cohort and split (also logged to MLflow)")
+    try:
+        st.image(client.plot(api_url(), run_id),
+                 caption="Pass rate before and after validation, per cohort and split (also logged to MLflow)")
+    except ApiError as e:
+        st.caption(f"Plot unavailable: {e}")
     st.caption(f"MLflow run `{ml.get('mlflow_run_id')}` in experiment 'synthetic_test_data_ml' "
                "(`make mlflow`, then http://localhost:5000): parameters, metrics, both models, this plot and the "
                "ML dataset.")

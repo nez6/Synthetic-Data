@@ -9,28 +9,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st  # noqa: E402
 
-from interface.common import api_up, api_url  # noqa: E402
+from interface import client  # noqa: E402
+from interface.common import api_url  # noqa: E402
 from interface.views import api_view, fhir_view, hl7_view, ml_view, profile_view, request_view, results_view  # noqa: E402
-from src import pools, runner  # noqa: E402
-from src.config import load_config  # noqa: E402
-from src.hl7v2.mllp import is_listening  # noqa: E402
 
 st.set_page_config(page_title="Synthetic Test Data Creator", page_icon="🧬", layout="wide")
-HL7 = load_config()["hl7"]
 
 with st.sidebar:
     st.header("System status")
-    st.session_state["api_url"] = st.text_input("API address", value=api_url())
-    pool_rows = pools.list_pools()
-    runs = runner.list_runs()
-    st.markdown(
-        "\n\n".join([f"{'✅' if p['alive'] else '⬜'} **Pool {p['pool']}**: {p['alive']:,} people, "
-                     f"ages {p['ages']}" for p in pool_rows] or ["⬜ **No Synthea pools yet**"])
-        + f"\n\n{'✅' if runs else '⬜'} **Runs**: {len(runs)}"
-        + f"\n\n{'✅' if 'profile' in st.session_state else '⬜'} **Real-data profile loaded**"
-        + f"\n\n{'✅' if api_up() else '❌'} **API** {api_url()}"
-        + f"\n\n{'✅' if is_listening(HL7['host'], HL7['port']) else '❌'} **HL7 listener** :{HL7['port']}")
+    st.session_state["api_url"] = st.text_input("API address", value=api_url(),
+                                                help="Every tab reads from and writes to this API.").rstrip("/")
+    h = client.health()
+    if h is None:
+        st.error(f"❌ API not reachable at {api_url()}. Cloud Run may be waking up; wait ~30 s and press Refresh.")
+    else:
+        boot = h.get("bootstrap") or {}
+        hl7 = h["hl7_listener"]
+        st.markdown(
+            f"✅ **API** {api_url()}\n\n"
+            + "\n\n".join([f"{'✅' if p['alive'] else '⬜'} **Pool {p['pool']}**: {p['alive']:,} people, "
+                           f"ages {p['ages']}" for p in h["pools"]] or ["⬜ **No Synthea pools yet**"])
+            + f"\n\n{'✅' if h['runs'] else '⬜'} **Runs**: {h['runs']}"
+            + f"\n\n{'✅' if 'profile' in st.session_state else '⬜'} **Real-data profile loaded**"
+            + f"\n\n{'✅' if hl7['listening'] else '❌'} **HL7 listener** :{hl7['port']} (inside the API)")
+        if boot.get("stage") in ("downloading", "training"):
+            st.info(f"⏳ Server warming up: {boot['message']}")
+        elif boot.get("stage") == "failed":
+            st.error(f"Start-up failed: {boot.get('error')}")
     st.button("🔄 Refresh")
+    st.markdown(f"[API docs]({api_url()}/docs)")
     st.divider()
     st.caption("All patients are synthetic (Synthea) and carry the HL7 HTEST label. Not for clinical use.")
 

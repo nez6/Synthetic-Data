@@ -10,7 +10,12 @@
         GET  /runs/{run_id}/patients/{id}?fhir_version=…   one delivered patient, any FHIR version
     ML  POST /predict                             P(record passes validation) from demographics only
     Also: /pools, /fhir/{version}/metadata, /fhir/{version}/$convert, /hl7/inbox, /health
+
+The Streamlit front end holds no data of its own: everything it shows comes from these endpoints
+(plus /runs/{id}/full, /runs/{id}/delivered-records, /runs/{id}/plot.png, /pools/eligible,
+/pools/profile, POST /hl7/send), so it can be hosted anywhere and pointed at the deployed API.
 """
+import os
 import threading
 import traceback
 import uuid
@@ -18,18 +23,20 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Body, FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from src import pools, runner
+from src import pipeline, pools, runner
 from src.config import load_config, resolve
 from src.fhir.builder import build_bundle
 from src.fhir.parser import bundle_to_record
 from src.fhir.versions import VERSIONS
 from src.hl7v2 import inbox
-from src.hl7v2.mllp import is_listening, start_in_thread
+from src.hl7v2.mllp import is_listening, send, start_in_thread
 from src.inference import ModelNotReady, predict_pass
 from src.request import apply_profile, default_request, problems
+from src.selection import eligible
 
 _listener = {"server": None, "error": None}
 _jobs: dict[str, dict] = {}
@@ -44,6 +51,8 @@ async def lifespan(_app):
             _listener["server"] = start_in_thread(cfg["host"], cfg["port"], handle_message)
         except OSError as e:
             _listener["error"] = f"Could not bind {cfg['host']}:{cfg['port']}: {e}"
+    if os.environ.get("BOOTSTRAP") == "1":   # set by `python -m src.pipeline serve` (the Docker image)
+        pipeline.bootstrap_in_background()
     yield
     if _listener["server"]:
         _listener["server"].shutdown()
@@ -64,6 +73,8 @@ def _run_or_404(run_id: str):
 def health():
     cfg = load_config()["hl7"]
     return {"status": "ok", "pools": pools.list_pools(), "runs": len(runner.list_runs()),
+            "bootstrap": {"stage": pipeline.STATE["stage"], "message": pipeline.STATE["message"],
+                          "error": (pipeline.STATE["error"] or "").split("\n")[0] or None},
             "hl7_listener": {"port": cfg["port"], "listening": is_listening(cfg["host"], cfg["port"]),
                              "error": _listener["error"]}}
 
@@ -71,6 +82,27 @@ def health():
 @app.get("/pools")
 def list_pools():
     return pools.list_pools()
+
+
+@app.post("/pools/eligible")
+def pools_eligible(request: dict = Body(...)):
+    """How many pool patients are eligible for each cohort of a request (shown before submitting)."""
+    out = []
+    for c in request.get("cohorts", []):
+        out.append({"cohort": c["name"], "pool": c["pool"], "eligible": sum(eligible(r, c) for r in pools.load_index(c["pool"]))})
+    return out
+
+
+@app.get("/pools/profile")
+def pools_profile():
+    """Demo: the aggregate profile of the Synthea pools themselves, as if they were your real data."""
+    from tools.data_quality_profile import profile_paths
+    names = [p["pool"] for p in pools.list_pools()]
+    if not names:
+        raise HTTPException(503, "No pools yet (the server is still downloading data).")
+    return profile_paths([str(pools.pools_dir() / n / "patients") for n in names],
+                         k_min=load_config()["privacy"]["k_min_cell_size"],
+                         source="Demo: Synthea pools " + "+".join(names))
 
 
 # ----------------------------------------------------------------------------- 01 request
@@ -146,6 +178,36 @@ def get_run(run_id: str):
     return {**{k: v for k, v in report.items() if k != "profiles"}, "ml_report": data["ml"]}
 
 
+@app.get("/runs/{run_id}/full")
+def get_run_full(run_id: str):
+    """Everything the dashboard shows for a run: request, report (with profiles), per-patient records, ML report."""
+    _run_or_404(run_id)
+    return runner.load_run(run_id)
+
+
+@app.get("/runs/{run_id}/delivered-records")
+def get_delivered_records(run_id: str):
+    """The delivered patients flattened to one record each (input for FHIR-version and HL7 views)."""
+    _run_or_404(run_id)
+    return jsonable_encoder([bundle_to_record(b) for b in runner.load_delivery(run_id)])
+
+
+@app.get("/runs/{run_id}/patients/{patient_id}/before-after")
+def get_before_after(run_id: str, patient_id: str):
+    _run_or_404(run_id)
+    try:
+        raw, validated = runner.record_before_after(run_id, patient_id)
+    except StopIteration:
+        raise HTTPException(404, f"{patient_id} was not tested in {run_id}")
+    return {"raw": raw, "validated": validated}
+
+
+@app.get("/runs/{run_id}/plot.png")
+def get_plot(run_id: str):
+    _run_or_404(run_id)
+    return FileResponse(runner.runs_dir() / run_id / "ml" / "pass_rates.png", media_type="image/png")
+
+
 @app.get("/runs/{run_id}/dataset")
 def get_dataset(run_id: str, format: str = "ndjson"):
     """Pull the delivered dataset: ndjson (FHIR R4 Bundles), csv (one row per patient) or zip (everything)."""
@@ -219,3 +281,29 @@ def fhir_convert(version: str, bundle: dict = Body(...)):
 @app.get("/hl7/inbox")
 def hl7_inbox(limit: int = 50):
     return inbox.recent(limit)
+
+
+@app.delete("/hl7/inbox")
+def hl7_inbox_clear():
+    inbox.clear()
+    return {"cleared": True}
+
+
+class Hl7Body(BaseModel):
+    message: str = Field(description="One HL7 v2 message, segments separated by \\r or newlines")
+
+
+@app.post("/hl7/send")
+def hl7_send(body: Hl7Body):
+    """Relay a message to the MLLP listener running inside this service and return its ACK.
+
+    MLLP is plain TCP, which most hosting platforms (Cloud Run included) do not expose; this lets a browser or
+    the dashboard exercise the same listener over HTTPS.
+    """
+    from src.hl7v2 import message as hl7
+    cfg = load_config()["hl7"]
+    if not is_listening(cfg["host"], cfg["port"]):
+        raise HTTPException(503, "HL7 listener is not running")
+    ack = send(cfg["host"], cfg["port"], hl7.normalize(body.message))
+    msa = hl7.first(hl7.parse(ack), "MSA")
+    return {"ack": ack, "code": hl7.field(msa, 1), "text": hl7.field(msa, 3)}

@@ -5,17 +5,15 @@ import json
 import pandas as pd
 import streamlit as st
 
-from interface.common import explain, pick_run
-from src import runner
+from interface import client
+from interface.common import api_url, explain, pick_run
 from src.fhir.builder import build_bundle
-from src.fhir.parser import bundle_to_record
 from src.fhir.validate import validate_bundle
 from src.fhir.versions import DIFFERENCES, VERSION_ORDER, VERSIONS, differences_between
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
 def _records(run_id):
-    return [bundle_to_record(b) for b in runner.load_delivery(run_id)]
+    return client.delivered_records(api_url(), run_id)
 
 
 def render():

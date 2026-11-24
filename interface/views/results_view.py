@@ -5,19 +5,9 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 
-from interface.common import load_run, pct, pick_run
-from src import runner
+from interface import client
+from interface.common import ApiError, api_url, load_run, pct, pick_run
 from src.request import FAULTS
-
-
-@st.cache_data(show_spinner="Packaging…", max_entries=4)
-def _zip(run_id):
-    return runner.zip_run(run_id)
-
-
-@st.cache_data(show_spinner=False, max_entries=4)
-def _csv(run_id):
-    return runner.dataset_table(run_id).to_csv(index=False).encode()
 
 
 def _cards(rep, req):
@@ -133,7 +123,12 @@ def render():
             fails += [f"audit: {f}" for f in r["independent_failures_after"]]
             st.dataframe(pd.DataFrame({"problem": fails or ["none"]}), hide_index=True, height=220)
         if st.button("Show resource counts before → after for this patient"):
-            raw, validated = runner.record_before_after(run_id, pid)
+            try:
+                both = client.get(f"/runs/{run_id}/patients/{pid}/before-after", timeout=120)
+            except ApiError as e:
+                st.error(str(e))
+                return
+            raw, validated = both["raw"], both["validated"]
             before = Counter(e["resource"]["resourceType"] for e in raw["entry"])
             after = Counter(e["resource"]["resourceType"] for e in validated["entry"])
             st.dataframe(pd.DataFrame([{"resource": t, "before": before[t], "after": after.get(t, 0)}
@@ -141,9 +136,15 @@ def render():
             st.download_button("⬇️ Validated bundle (JSON)", json.dumps(validated, indent=1), f"{pid}.json")
 
     st.markdown("#### Download the delivery set")
+    st.caption(f"Served by GET {api_url()}/runs/{run_id}/dataset?format=…")
     d1, d2, d3 = st.columns(3)
-    d1.download_button("⬇️ Everything (.zip)", _zip(run_id), f"{run_id}.zip", "application/zip",
-                       help="FHIR NDJSON, CSV, HL7 v2 messages, request, report, per-patient results, ML artifacts")
-    d2.download_button("⬇️ One row per patient (.csv)", _csv(run_id), f"{run_id}.csv", "text/csv")
-    d3.download_button("⬇️ FHIR R4 Bundles (.ndjson.gz)",
-                       (runner.runs_dir() / run_id / "delivery.ndjson.gz").read_bytes(), f"{run_id}.ndjson.gz")
+    for col, fmt, label, name, mime in (
+            (d1, "zip", "⬇️ Everything (.zip)", f"{run_id}.zip", "application/zip"),
+            (d2, "csv", "⬇️ One row per patient (.csv)", f"{run_id}.csv", "text/csv"),
+            (d3, "ndjson", "⬇️ FHIR R4 Bundles (.ndjson.gz)", f"{run_id}.ndjson.gz", "application/gzip")):
+        key = f"dl_{fmt}_{run_id}"
+        if st.session_state.get(key):
+            col.download_button(label, client.dataset(api_url(), run_id, fmt), name, mime)
+        elif col.button(f"Prepare {fmt}", key=f"prep_{key}"):
+            st.session_state[key] = True
+            st.rerun()

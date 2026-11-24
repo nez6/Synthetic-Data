@@ -1,25 +1,18 @@
 """Helpers shared by the dashboard views."""
-import os
-
 import altair as alt
 import pandas as pd
-import requests
 import streamlit as st
+
+from interface import client
+from interface.client import ApiError, api_url  # noqa: F401 — re-exported for the views
 
 SERIES = "#2a78d6"     # categorical slot 1
 SERIES_2 = "#eb6834"   # categorical slot 2
 INK = "#55554f"
 
 
-def api_url() -> str:
-    return st.session_state.get("api_url") or os.environ.get("API_URL", "http://localhost:8000")
-
-
 def api_up() -> bool:
-    try:
-        return requests.get(f"{api_url()}/health", timeout=2).status_code == 200
-    except requests.RequestException:
-        return False
+    return client.health() is not None
 
 
 def pct(x, digits=1) -> str:
@@ -55,23 +48,20 @@ def grouped_hbar(df: pd.DataFrame, cat: str, series: str, val: str, title: str, 
     st.altair_chart(chart, width="stretch")
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def cached_run(run_id: str, _mtime: float):
-    from src import runner
-    return runner.load_run(run_id)
-
-
-def load_run(run_id: str):
-    from src import runner
-    p = runner.runs_dir() / run_id / "report.json"
-    return cached_run(run_id, p.stat().st_mtime)
+def load_run(run_id: str) -> dict:
+    """{report, request, records, ml} for one run, from GET /runs/{id}/full."""
+    return client.run_full(api_url(), run_id)
 
 
 def pick_run(key: str):
-    from src import runner
-    runs = runner.list_runs()
+    try:
+        runs = client.runs(api_url())
+    except ApiError as e:
+        st.error(str(e))
+        return None
     if not runs:
-        st.warning("No runs yet. Submit a request in the **📝 Request** tab.")
+        st.warning("No runs yet. Submit a request in the **📝 Request** tab (a fresh deployment trains one on "
+                   "start-up; see the sidebar).")
         return None
     ids = [r["run_id"] for r in runs]
     current = st.session_state.get("run_id", ids[0])

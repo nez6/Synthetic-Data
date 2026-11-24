@@ -5,31 +5,34 @@ import uuid
 import pandas as pd
 import streamlit as st
 
-from interface.common import explain, pick_run
-from src import runner
-from src.config import load_config
-from src.fhir.parser import bundle_to_record
-from src.hl7v2 import inbox
+from interface import client
+from interface.common import ApiError, api_url, explain, pick_run
 from src.hl7v2 import message as hl7
-from src.hl7v2.mllp import is_listening, send
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
 def _records(run_id):
-    return [bundle_to_record(b) for b in runner.load_delivery(run_id)]
+    return client.delivered_records(api_url(), run_id)
+
+
+def _send(text: str) -> tuple[str, str]:
+    """Relay through POST /hl7/send to the MLLP listener inside the API; returns (ack code, ack text)."""
+    res = client.post("/hl7/send", {"message": text})
+    return res["code"], res["ack"]
 
 
 def render():
-    cfg = load_config()["hl7"]
-    host, port = cfg["host"], cfg["port"]
+    h = client.health() or {}
+    hl7cfg = h.get("hl7_listener") or {}
+    port = hl7cfg.get("port", 2575)
     st.subheader("📨 Deliver test patients over HL7 v2")
     explain(f"Many systems still receive lab results as **HL7 v2 ORU^R01** over **MLLP** (TCP). The API runs a "
-            f"listener on {host}:{port}: each message is parsed, mapped to FHIR R4, given a record-level quality "
+            f"MLLP listener on port {port} inside the API; this tab relays messages to it through "
+            "`POST /hl7/send` (MLLP is raw TCP, which Cloud Run does not expose). Each message is parsed, mapped to FHIR R4, given a record-level quality "
             "score, scored by the model, stored in the inbox and acknowledged (AA accepted, AE error, AR rejected). "
             "Point your own HL7 interface engine at the same messages to test it.")
-    listening = is_listening(host, port)
-    (st.success if listening else st.error)(f"Listener {'running' if listening else 'not running'} on {host}:{port}"
-                                            + ("" if listening else ". Start the API (`make run`)."))
+    listening = bool(hl7cfg.get("listening"))
+    (st.success if listening else st.error)(f"Listener {'running' if listening else 'not running'} on port {port} "
+                                            f"of {api_url()}" + ("" if listening else ". Start the API (`make run`)."))
     run_id = pick_run("hl7_run")
     if run_id:
         recs = _records(run_id)
@@ -43,9 +46,12 @@ def render():
                 st.dataframe(pd.DataFrame(hl7.describe(hl7.parse(text))), hide_index=True, width="stretch")
             c1, c2 = st.columns(2)
             if c1.button("📤 Send over MLLP", type="primary", disabled=not listening):
-                ack = send(host, port, hl7.normalize(text))
+                try:
+                    code, ack = _send(text)
+                except ApiError as e:
+                    st.error(str(e))
+                    return
                 msa = hl7.first(hl7.parse(ack), "MSA")
-                code = hl7.field(msa, 1)
                 (st.success if code == "AA" else st.error)(f"ACK **{code}** ({hl7.ACK_CODES.get(code, '?')}): "
                                                            f"{hl7.field(msa, 3)}")
                 st.code(ack.replace("\r", "\n"), language="text")
@@ -54,13 +60,16 @@ def render():
             if c2.button("📤 Send batch", disabled=not listening):
                 codes = {}
                 for r in recs[: int(n)]:
-                    a = send(host, port, hl7.build_oru(r, uuid.uuid4().hex[:10].upper()))
-                    c = hl7.field(hl7.first(hl7.parse(a), "MSA"), 1)
+                    c, _ = _send(hl7.build_oru(r, uuid.uuid4().hex[:10].upper()))
                     codes[c] = codes.get(c, 0) + 1
                 st.success("ACKs: " + ", ".join(f"{k} × {v}" for k, v in codes.items()))
 
     st.markdown("#### Inbox")
-    rows = inbox.recent(200)
+    try:
+        rows = client.get("/hl7/inbox", limit=200)
+    except ApiError as e:
+        st.error(str(e))
+        return
     if not rows:
         st.caption("No messages yet.")
         return
@@ -76,5 +85,5 @@ def render():
     t2.code(json.dumps(r["fhir_bundle"], indent=2) if r["fhir_bundle"] else "(rejected)", language="json")
     t3.json(r["prediction"] or {"note": r["ack_text"]})
     if st.button("🗑️ Clear inbox"):
-        inbox.clear()
+        client.delete("/hl7/inbox")
         st.rerun()
