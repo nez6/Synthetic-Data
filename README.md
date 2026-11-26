@@ -197,6 +197,26 @@ tests/                      pytest suite and 12 Synthea fixture patients
 - **The model is deliberately simple** and isn't a clinical tool. Predictions describe synthetic data quality, never a real person.
 - **Operational limits:** runs live in the Cloud Run container, so they're lost when the instance is recycled (a new one re-downloads the data and retrains). The HL7 MLLP port is only reachable inside the container, which is why `POST /hl7/send` relays to it over HTTPS.
 
+## Verification
+
+Checked on 24 Nov 2026:
+
+| Check | Result |
+|---|---|
+| Tests (`make test`) | 63 passed |
+| `docker build` from a fresh clone of `main` (Google Cloud Shell) | Built in 161 s; `docker run … serve` started, downloaded the pools from GCS and served `/health` |
+| Cloud Run (same Dockerfile, built by Cloud Build) | Start-up downloads the data and trains in ~6 min; `/health` reports `ready` |
+| Live `/predict` | `{"age":72,"sex":"female","race_ethnicity":"Hispanic/Latino","cohort":"B"}` → `{"model":"validated","probability_pass":0.0411,"predicted_pass":false}`. Same value as a local run, so the pipeline is reproducible |
+| Live front end | Sidebar shows the API as reachable; the ML tab's Predict calls the deployed `/predict` |
+
+> The API scales to zero after ~15 idle minutes. The first request afterwards waits ~6 minutes while it re-downloads the data and retrains; the front end's sidebar shows the progress.
+
+Docker Desktop doesn't run on the author's Mac (macOS 13), so the local container test was done in Google Cloud Shell. Its `serve` run was cut off by a Cloud Shell sign-out during the 577 MB download; the full serve path, from data download through training to `/predict`, is shown by Cloud Run, which runs the same image.
+
 ## Collaboration
 
-Work happens on feature branches and is merged into `main` through pull requests. CI runs the tests on every PR.
+This is a solo project (no partner). Work happens on feature branches and is merged into `main` through pull requests:
+- PR #1 (`feature/custom-dataset-creator`) holds the pipeline, cloud ingestion, Docker, deployment and front end.
+- This verification section was added on `docs/verification`.
+
+CI runs the tests on every PR.
